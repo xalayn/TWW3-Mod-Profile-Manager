@@ -7,7 +7,9 @@ license = "MIT"
 
 [dependencies]
 anyhow = "1"
+image = { version = "=0.25.9", default-features = false, features = ["png", "jpeg"] }
 ratatui = "0.29"
+ratatui-image = "8.0.1"
 serde_json = { version = "1", features = ["preserve_order"] }
 
 [profile.release]
