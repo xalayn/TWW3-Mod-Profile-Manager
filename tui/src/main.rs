@@ -203,6 +203,8 @@ struct App {
     status: String,
     confirm_quit: bool,
     mode: Mode,
+    /// Profile that was last applied or saved; `s` keeps it in sync.
+    current_profile: Option<String>,
     profiles: Vec<String>,
     profile_list: ListState,
     confirm_delete: bool,
@@ -243,6 +245,7 @@ impl App {
             status: String::new(),
             confirm_quit: false,
             mode: Mode::Browse,
+            current_profile: None,
             profiles: Vec::new(),
             profile_list: ListState::default(),
             confirm_delete: false,
@@ -307,7 +310,16 @@ impl App {
         fs::rename(&tmp, &self.path)?;
 
         self.dirty = false;
-        self.status = format!("Saved {} mods (backup: {file_name}.bak)", self.mods.len());
+        self.status = match &self.current_profile {
+            Some(name) => match self.write_modlist(name) {
+                Ok(()) => format!(
+                    "Saved {} mods + profile '{name}' (backup: {file_name}.bak)",
+                    self.mods.len()
+                ),
+                Err(e) => format!("Saved mods, but updating profile '{name}' failed: {e:#}"),
+            },
+            None => format!("Saved {} mods (backup: {file_name}.bak)", self.mods.len()),
+        };
         Ok(())
     }
 
@@ -342,7 +354,7 @@ impl App {
             .map(String::as_str)
     }
 
-    fn save_profile(&mut self, name: &str) -> Result<()> {
+    fn write_modlist(&self, name: &str) -> Result<()> {
         let mods: Vec<Value> = self
             .mods
             .iter()
@@ -355,6 +367,12 @@ impl App {
         fs::create_dir_all(&dir)?;
         let text = serde_json::to_string_pretty(&serde_json::json!({ "mods": mods }))?;
         fs::write(dir.join(format!("{name}.json")), text)?;
+        Ok(())
+    }
+
+    fn save_profile(&mut self, name: &str) -> Result<()> {
+        self.write_modlist(name)?;
+        self.current_profile = Some(name.to_string());
         self.status = format!("Saved profile '{name}' ({} mods)", self.mods.len());
         Ok(())
     }
@@ -396,6 +414,7 @@ impl App {
         let missing = wanted.len() - matched;
         let extra = self.mods.len() - matched;
         self.dirty = true;
+        self.current_profile = Some(name.to_string());
         self.status = format!(
             "Applied profile '{name}': {matched} matched, {extra} not in profile, \
              {missing} in profile but not installed — press s to save"
@@ -405,6 +424,9 @@ impl App {
 
     fn delete_profile(&mut self, name: &str) -> Result<()> {
         fs::remove_file(modlists_dir().join(format!("{name}.json")))?;
+        if self.current_profile.as_deref() == Some(name) {
+            self.current_profile = None;
+        }
         self.status = format!("Deleted profile '{name}'");
         Ok(())
     }
@@ -433,9 +455,17 @@ fn draw(f: &mut Frame, app: &mut App) {
         Layout::horizontal([Constraint::Min(58), Constraint::Length(46)]).areas(main);
 
     let dirty_mark = if app.dirty { "  [modified]" } else { "" };
+    let profile_mark = app
+        .current_profile
+        .as_ref()
+        .map(|p| format!("  [profile: {p}]"))
+        .unwrap_or_default();
     f.render_widget(
-        Paragraph::new(format!(" twwh3-mods — {}{dirty_mark}", app.path.display()))
-            .style(Style::default().add_modifier(Modifier::BOLD)),
+        Paragraph::new(format!(
+            " twwh3-mods — {}{profile_mark}{dirty_mark}",
+            app.path.display()
+        ))
+        .style(Style::default().add_modifier(Modifier::BOLD)),
         header,
     );
 
@@ -595,7 +625,14 @@ fn draw_profiles_popup(f: &mut Frame, app: &mut App) {
     } else {
         app.profiles
             .iter()
-            .map(|p| ListItem::new(p.clone()))
+            .map(|p| {
+                if app.current_profile.as_deref() == Some(p.as_str()) {
+                    ListItem::new(format!("{p} (current)"))
+                        .style(Style::default().add_modifier(Modifier::BOLD))
+                } else {
+                    ListItem::new(p.clone())
+                }
+            })
             .collect()
     };
     let list = List::new(items)
