@@ -24,11 +24,26 @@
             platforms = systems;
           };
         };
+        twwh3-mods = pkgs.rustPlatform.buildRustPackage {
+          pname = "twwh3-mods";
+          version = "0.1.0";
+          src = ./tui;
+          cargoLock.lockFile = ./tui/Cargo.lock;
+          meta = {
+            description = "TUI mod load-order manager for Total War: WARHAMMER III";
+            homepage = "https://github.com/xalayn/TWW3-Mod-Profile-Manager";
+            license = nixpkgs.lib.licenses.mit;
+            mainProgram = "twwh3-mods";
+            platforms = systems;
+          };
+        };
+
         default = twwh3-profile;
       });
 
       overlays.default = final: prev: {
         twwh3-profile = self.packages.${final.system}.twwh3-profile;
+        twwh3-mods = self.packages.${final.system}.twwh3-mods;
       };
     };
 }
