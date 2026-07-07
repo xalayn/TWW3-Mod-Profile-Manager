@@ -69,6 +69,11 @@ fn modlists_dir() -> PathBuf {
         .join("Games/TotalWarWH3/modlists")
 }
 
+/// Remembers which profile is current across restarts.
+fn current_profile_file() -> PathBuf {
+    modlists_dir().join(".current")
+}
+
 fn workshop_dir() -> PathBuf {
     if let Ok(p) = env::var("TWWH3_WORKSHOP") {
         return PathBuf::from(p);
@@ -369,7 +374,27 @@ impl App {
         } else if app.slots.is_empty() {
             app.focus = Pane::Available;
         }
+        // Restore which profile we were on, if it still exists.
+        app.current_profile = fs::read_to_string(current_profile_file())
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|n| !n.is_empty())
+            .filter(|n| modlists_dir().join(format!("{n}.json")).exists());
         Ok(app)
+    }
+
+    /// Change the current profile and persist the choice.
+    fn set_current(&mut self, name: Option<String>) {
+        self.current_profile = name;
+        match &self.current_profile {
+            Some(n) => {
+                let _ = fs::create_dir_all(modlists_dir());
+                let _ = fs::write(current_profile_file(), n);
+            }
+            None => {
+                let _ = fs::remove_file(current_profile_file());
+            }
+        }
     }
 
     /// Pool indices of installed mods not currently in the load order,
@@ -634,7 +659,7 @@ impl App {
 
     fn save_profile(&mut self, name: &str) -> Result<()> {
         self.write_modlist(name)?;
-        self.current_profile = Some(name.to_string());
+        self.set_current(Some(name.to_string()));
         self.status = format!("Saved profile '{name}' ({} mods)", self.slots.len());
         Ok(())
     }
@@ -661,14 +686,17 @@ impl App {
             self.avail_state.select(Some(0));
         }
         self.dirty = true;
-        self.current_profile = Some(name.to_string());
+        self.set_current(Some(name.to_string()));
+        // Switching profiles takes effect immediately; no unsaved state
+        // to worry about afterwards.
+        self.save()?;
         let note = if missing > 0 {
             format!(", {missing} missing (kept in profile, not enabled)")
         } else {
             String::new()
         };
         self.status = format!(
-            "Applied profile '{name}': {} mods{note} — press s to save",
+            "Switched to profile '{name}': {} mods{note}",
             self.slots.len()
         );
         Ok(())
@@ -677,7 +705,7 @@ impl App {
     fn delete_profile(&mut self, name: &str) -> Result<()> {
         fs::remove_file(modlists_dir().join(format!("{name}.json")))?;
         if self.current_profile.as_deref() == Some(name) {
-            self.current_profile = None;
+            self.set_current(None);
         }
         self.status = format!("Deleted profile '{name}'");
         Ok(())
@@ -710,20 +738,54 @@ fn draw(f: &mut Frame, app: &mut App) {
     ])
     .areas(main);
 
-    let dirty_mark = if app.dirty { "  [modified]" } else { "" };
-    let profile_mark = app
-        .current_profile
-        .as_ref()
-        .map(|p| format!("  [profile: {p}]"))
-        .unwrap_or_default();
-    f.render_widget(
-        Paragraph::new(format!(
-            " twwh3-mods — {}{profile_mark}{dirty_mark}",
-            app.path.display()
-        ))
-        .style(Style::default().add_modifier(Modifier::BOLD)),
-        header,
-    );
+    // Profile front and center on the left; the moddata path (dim,
+    // head-truncated) right-aligned in whatever space is left.
+    let mut spans = vec![
+        Span::styled(" twwh3-mods ", Style::default().add_modifier(Modifier::BOLD)),
+        Span::styled("· profile: ", Style::default().fg(Color::DarkGray)),
+        profile_span(app),
+    ];
+    if app.dirty {
+        spans.push(Span::styled(
+            "  [modified]",
+            Style::default().fg(Color::Yellow),
+        ));
+    }
+    let left = Line::from(spans);
+    let left_width = left.width() as u16;
+    f.render_widget(Paragraph::new(left), header);
+
+    let pad = left_width + 2;
+    if header.width > pad + 12 {
+        let path_area = Rect::new(header.x + pad, header.y, header.width - pad, 1);
+        let path = app.path.display().to_string();
+        let home = env::var("HOME").unwrap_or_default();
+        let path = if home.is_empty() {
+            path
+        } else {
+            path.replacen(&home, "~", 1)
+        };
+        let room = path_area.width as usize - 1;
+        let shown = if path.chars().count() > room {
+            let tail: String = path
+                .chars()
+                .rev()
+                .take(room.saturating_sub(1))
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
+            format!("…{tail} ")
+        } else {
+            format!("{path} ")
+        };
+        f.render_widget(
+            Paragraph::new(shown)
+                .style(Style::default().fg(Color::DarkGray))
+                .alignment(Alignment::Right),
+            path_area,
+        );
+    }
 
     draw_available(f, app, avail_area);
     draw_profile(f, app, prof_area);
@@ -750,7 +812,21 @@ fn draw(f: &mut Frame, app: &mut App) {
     }
 }
 
-fn pane_block(title: String, focused: bool) -> Block<'static> {
+/// The current profile name, styled so it stands out (yellow "(unsaved)"
+/// when the load order isn't attached to a profile yet).
+fn profile_span(app: &App) -> Span<'static> {
+    match &app.current_profile {
+        Some(p) => Span::styled(
+            p.clone(),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        None => Span::styled("(unsaved)", Style::default().fg(Color::Yellow)),
+    }
+}
+
+fn pane_block(title: Line<'static>, focused: bool) -> Block<'static> {
     let block = Block::default().borders(Borders::ALL).title(title);
     if focused {
         block.border_style(Style::default().fg(Color::Cyan))
@@ -792,7 +868,7 @@ fn draw_available(f: &mut Frame, app: &mut App, area: Rect) {
     let (hl, sym) = highlight(focused);
     let table = Table::new(rows, [Constraint::Min(20), Constraint::Length(9)])
         .block(pane_block(
-            format!(" Available ({}) ", avail.len()),
+            Line::from(format!(" Available ({}) ", avail.len())),
             focused,
         ))
         .row_highlight_style(hl)
@@ -827,11 +903,11 @@ fn draw_profile(f: &mut Frame, app: &mut App, area: Rect) {
         .collect();
     let focused = app.focus == Pane::Profile;
     let (hl, sym) = highlight(focused);
-    let title = format!(
-        " Load order — {} ({}) ",
-        app.current_profile.as_deref().unwrap_or("unsaved"),
-        app.slots.len()
-    );
+    let title = Line::from(vec![
+        Span::raw(" Load order — "),
+        profile_span(app),
+        Span::raw(format!(" ({}) ", app.slots.len())),
+    ]);
     let table = Table::new(rows, [Constraint::Length(3), Constraint::Min(20)])
         .block(pane_block(title, focused))
         .row_highlight_style(hl)
