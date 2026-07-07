@@ -24,6 +24,18 @@
             platforms = systems;
           };
         };
+        twwh3-run = pkgs.writeShellApplication {
+          name = "twwh3-run";
+          text = builtins.readFile ./twwh3-run.sh;
+          meta = {
+            description = "Steam launch-option shim for Total War: WARHAMMER III (use: twwh3-run %command%)";
+            homepage = "https://github.com/xalayn/TWW3-Mod-Profile-Manager";
+            license = nixpkgs.lib.licenses.mit;
+            mainProgram = "twwh3-run";
+            platforms = systems;
+          };
+        };
+
         twwh3-mods = pkgs.rustPlatform.buildRustPackage {
           pname = "twwh3-mods";
           version = "0.1.0";
@@ -38,12 +50,23 @@
           };
         };
 
-        default = twwh3-profile;
+        # Everything in one output: result/bin/{twwh3-profile,twwh3-mods,twwh3-run}
+        default = pkgs.symlinkJoin {
+          name = "twwh3-tools";
+          paths = [ twwh3-profile twwh3-mods twwh3-run ];
+          meta = {
+            description = "Mod profile manager, TUI, and launch shim for Total War: WARHAMMER III";
+            homepage = "https://github.com/xalayn/TWW3-Mod-Profile-Manager";
+            license = nixpkgs.lib.licenses.mit;
+            platforms = systems;
+          };
+        };
       });
 
       overlays.default = final: prev: {
         twwh3-profile = self.packages.${final.system}.twwh3-profile;
         twwh3-mods = self.packages.${final.system}.twwh3-mods;
+        twwh3-run = self.packages.${final.system}.twwh3-run;
       };
     };
 }

@@ -31,10 +31,12 @@ use ratatui_image::picker::Picker;
 use ratatui_image::protocol::StatefulProtocol;
 use ratatui_image::StatefulImage;
 use serde_json::Value;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const APPID: u32 = 1142710;
 const GAME: &str = "warhammer3";
@@ -81,11 +83,127 @@ fn workshop_dir() -> PathBuf {
     steam_root().join(format!("steamapps/workshop/content/{APPID}"))
 }
 
+/// Local store of past mod versions: vault/<steam_id>/<manifest>/<pack>.
+fn vault_dir() -> PathBuf {
+    if let Ok(p) = env::var("TWWH3_VAULT") {
+        return PathBuf::from(p);
+    }
+    PathBuf::from(env::var("HOME").unwrap_or_else(|_| ".".into()))
+        .join("Games/TotalWarWH3/vault")
+}
+
 /// Convert a wine path like "Z:/home/x/y.pack" to a unix path.
 fn win_to_unix(p: &str) -> Option<PathBuf> {
     let p = p.replace('\\', "/");
     let rest = p.strip_prefix("Z:").or_else(|| p.strip_prefix("z:"))?;
     Some(PathBuf::from(rest))
+}
+
+/// Convert a unix path to the wine path the game sees under Proton.
+fn unix_to_win(p: &Path) -> String {
+    format!("Z:{}", p.display())
+}
+
+// ---------------------------------------------------------------------------
+// Steam manifests (VDF text format, parsed just enough for our needs)
+
+/// First `"key" "value"` occurrence anywhere in a VDF document.
+fn vdf_str(text: &str, key: &str) -> Option<String> {
+    for line in text.lines() {
+        let p: Vec<&str> = line.trim().split('"').collect();
+        if p.len() >= 4 && p[1] == key {
+            return Some(p[3].to_string());
+        }
+    }
+    None
+}
+
+#[derive(Clone, Default)]
+struct WsInfo {
+    size: u64,
+    timeupdated: u64,
+    /// Steam depot manifest id — changes on every workshop update, so it
+    /// identifies an exact version of a mod.
+    manifest: String,
+}
+
+/// Per-item size/timeupdated/manifest from appworkshop_<appid>.acf.
+fn parse_workshop_acf(text: &str) -> HashMap<String, WsInfo> {
+    let mut map: HashMap<String, WsInfo> = HashMap::new();
+    let mut pending: Option<String> = None;
+    let mut cur: Option<(String, WsInfo)> = None;
+    let mut depth = 0i32;
+    let mut cur_depth = 0i32;
+    for raw in text.lines() {
+        let line = raw.trim();
+        match line {
+            "{" => {
+                depth += 1;
+                if cur.is_none() {
+                    if let Some(id) = pending.take() {
+                        cur = Some((id, WsInfo::default()));
+                        cur_depth = depth;
+                    }
+                }
+                pending = None;
+            }
+            "}" => {
+                if depth == cur_depth {
+                    if let Some((id, info)) = cur.take() {
+                        // Both ItemsInstalled and ItemDetails carry these
+                        // fields; prefer whichever copy has a manifest.
+                        match map.get(&id) {
+                            Some(old) if !old.manifest.is_empty() && info.manifest.is_empty() => {}
+                            _ => {
+                                map.insert(id, info);
+                            }
+                        }
+                    }
+                }
+                depth -= 1;
+            }
+            _ => {
+                let p: Vec<&str> = line.split('"').collect();
+                if p.len() >= 4 {
+                    if let Some((_, info)) = cur.as_mut() {
+                        match p[1] {
+                            "size" => info.size = p[3].parse().unwrap_or(0),
+                            "timeupdated" => info.timeupdated = p[3].parse().unwrap_or(0),
+                            "manifest" => info.manifest = p[3].to_string(),
+                            _ => {}
+                        }
+                    }
+                } else if p.len() >= 2
+                    && p[1].len() >= 6
+                    && p[1].chars().all(|c| c.is_ascii_digit())
+                {
+                    pending = Some(p[1].to_string());
+                } else {
+                    pending = None;
+                }
+            }
+        }
+    }
+    map
+}
+
+fn load_workshop_info() -> HashMap<String, WsInfo> {
+    let path = steam_root().join(format!("steamapps/workshop/appworkshop_{APPID}.acf"));
+    fs::read_to_string(path)
+        .map(|t| parse_workshop_acf(&t))
+        .unwrap_or_default()
+}
+
+fn load_game_buildid() -> Option<String> {
+    let path = steam_root().join(format!("steamapps/appmanifest_{APPID}.acf"));
+    vdf_str(&fs::read_to_string(path).ok()?, "buildid")
+}
+
+fn game_install_dir() -> Option<PathBuf> {
+    let path = steam_root().join(format!("steamapps/appmanifest_{APPID}.acf"));
+    let installdir = vdf_str(&fs::read_to_string(path).ok()?, "installdir")?;
+    let dir = steam_root().join("steamapps/common").join(installdir);
+    dir.is_dir().then_some(dir)
 }
 
 // ---------------------------------------------------------------------------
@@ -245,6 +363,44 @@ fn discover_workshop_mods(mods: &mut Vec<ModEntry>) {
     mods.extend(found);
 }
 
+/// Copy a mod's pack (+ thumbnail) into the vault under its manifest id,
+/// unless that exact version is already vaulted. Returns true if copied.
+fn vault_pack(entry: &ModEntry, manifest: &str) -> Result<bool> {
+    let (Some(sid), Some(pack)) = (&entry.steam_id, &entry.pack_path) else {
+        return Ok(false);
+    };
+    if manifest.is_empty() || entry.missing {
+        return Ok(false);
+    }
+    let dst_dir = vault_dir().join(sid).join(manifest);
+    let Some(fname) = pack.file_name() else { return Ok(false) };
+    let dst = dst_dir.join(fname);
+    if dst.exists() {
+        return Ok(false);
+    }
+    fs::create_dir_all(&dst_dir)
+        .with_context(|| format!("could not create {}", dst_dir.display()))?;
+    // Copy to a temp name first so an interrupted copy can't be mistaken
+    // for a complete vaulted version.
+    let tmp = dst_dir.join(format!(".{}.tmp", fname.to_string_lossy()));
+    fs::copy(pack, &tmp).with_context(|| format!("could not vault {}", pack.display()))?;
+    fs::rename(&tmp, &dst)?;
+    if let Some(png) = &entry.png {
+        if let Some(png_name) = png.file_name() {
+            let _ = fs::copy(png, dst_dir.join(png_name));
+        }
+    }
+    Ok(true)
+}
+
+/// Where the vaulted copy of a specific mod version lives, if it exists.
+fn vaulted_pack(entry: &ModEntry, manifest: &str) -> Option<PathBuf> {
+    let sid = entry.steam_id.as_ref()?;
+    let fname = entry.pack_path.as_ref()?.file_name()?;
+    let p = vault_dir().join(sid).join(manifest).join(fname);
+    p.exists().then_some(p)
+}
+
 fn human_size(b: u64) -> String {
     const KIB: u64 = 1024;
     const MIB: u64 = 1024 * KIB;
@@ -283,6 +439,14 @@ struct Slot {
 struct PreviewLine {
     label: String,
     missing: bool,
+    updated: bool,
+}
+
+/// A profile entry as stored on disk (v2 adds version pins).
+struct MlEntry {
+    uuid: String,
+    steam_id: Option<String>,
+    manifest: Option<String>,
 }
 
 struct App {
@@ -303,6 +467,12 @@ struct App {
     mode: Mode,
     /// Profile that was last applied or saved; `s` keeps it in sync.
     current_profile: Option<String>,
+    /// Current workshop state: steam_id -> version info.
+    ws: HashMap<String, WsInfo>,
+    game_buildid: Option<String>,
+    /// Version pins of the current profile: uuid -> pinned manifest.
+    pins: HashMap<String, String>,
+    pinned_buildid: Option<String>,
     profiles: Vec<String>,
     profile_list: ListState,
     /// Which profile the cached popup preview belongs to.
@@ -359,6 +529,10 @@ impl App {
             confirm_quit: false,
             mode: Mode::Browse,
             current_profile: None,
+            ws: load_workshop_info(),
+            game_buildid: load_game_buildid(),
+            pins: HashMap::new(),
+            pinned_buildid: None,
             profiles: Vec::new(),
             profile_list: ListState::default(),
             preview_for: None,
@@ -371,7 +545,8 @@ impl App {
         }
         if !app.available().is_empty() {
             app.avail_state.select(Some(0));
-        } else if app.slots.is_empty() {
+        }
+        if app.slots.is_empty() {
             app.focus = Pane::Available;
         }
         // Restore which profile we were on, if it still exists.
@@ -380,7 +555,74 @@ impl App {
             .map(|s| s.trim().to_string())
             .filter(|n| !n.is_empty())
             .filter(|n| modlists_dir().join(format!("{n}.json")).exists());
+        if let Some(name) = app.current_profile.clone() {
+            app.load_pins(&name);
+            app.status = app.drift_report().unwrap_or_default();
+        }
         Ok(app)
+    }
+
+    /// Load the version pins recorded in a profile file.
+    fn load_pins(&mut self, name: &str) {
+        self.pins.clear();
+        self.pinned_buildid = None;
+        let path = modlists_dir().join(format!("{name}.json"));
+        let Some(root) = fs::read_to_string(path)
+            .ok()
+            .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+        else {
+            return;
+        };
+        self.pinned_buildid = root
+            .get("game_buildid")
+            .and_then(Value::as_str)
+            .map(String::from);
+        for e in root.get("mods").and_then(Value::as_array).into_iter().flatten() {
+            if let (Some(uuid), Some(man)) = (
+                e.get("uuid").and_then(Value::as_str),
+                e.get("manifest").and_then(Value::as_str),
+            ) {
+                self.pins.insert(uuid.to_lowercase(), man.to_string());
+            }
+        }
+    }
+
+    /// The pinned manifest differs from what's installed now.
+    fn slot_updated(&self, s: &Slot) -> bool {
+        let Some(pinned) = self.pins.get(&s.uuid) else { return false };
+        let Some(i) = s.idx else { return false };
+        let Some(sid) = &self.pool[i].steam_id else { return false };
+        self.ws
+            .get(sid)
+            .is_some_and(|w| !w.manifest.is_empty() && &w.manifest != pinned)
+    }
+
+    /// Human summary of what changed since the current profile was saved.
+    fn drift_report(&self) -> Option<String> {
+        let name = self.current_profile.as_deref()?;
+        let updated = self.slots.iter().filter(|s| self.slot_updated(s)).count();
+        let game_moved = match (&self.pinned_buildid, &self.game_buildid) {
+            (Some(a), Some(b)) => a != b,
+            _ => false,
+        };
+        if updated == 0 && !game_moved {
+            return None;
+        }
+        let mut parts = Vec::new();
+        if updated > 0 {
+            parts.push(format!("{updated} mods updated by Steam"));
+        }
+        if game_moved {
+            parts.push(format!(
+                "game updated (build {} → {})",
+                self.pinned_buildid.as_deref().unwrap_or("?"),
+                self.game_buildid.as_deref().unwrap_or("?")
+            ));
+        }
+        Some(format!(
+            "Since '{name}' was saved: {} — L launches with pinned versions where vaulted",
+            parts.join("; ")
+        ))
     }
 
     /// Change the current profile and persist the choice.
@@ -510,6 +752,25 @@ impl App {
     // -- saving -------------------------------------------------------------
 
     fn save(&mut self) -> Result<()> {
+        let backup = self.save_moddata()?;
+        let enabled = self.slots.iter().filter(|s| !self.slot_missing(s)).count();
+        self.status = match self.current_profile.clone() {
+            Some(name) => match self.write_modlist(&name) {
+                Ok(vaulted) if vaulted > 0 => format!(
+                    "Saved: {enabled} mods enabled + profile '{name}', {vaulted} pack versions vaulted (backup: {backup})"
+                ),
+                Ok(_) => format!(
+                    "Saved: {enabled} mods enabled + profile '{name}' (backup: {backup})"
+                ),
+                Err(e) => format!("Saved mods, but updating profile '{name}' failed: {e:#}"),
+            },
+            None => format!("Saved: {enabled} mods enabled (backup: {backup})"),
+        };
+        Ok(())
+    }
+
+    /// Write the launcher moddata file only. Returns the backup file name.
+    fn save_moddata(&mut self) -> Result<String> {
         // Mods in the load order become active (unless their pack is
         // gone) and come first; everything else is inactive, after them.
         let in_order: Vec<usize> = self.slots.iter().filter_map(|s| s.idx).collect();
@@ -552,17 +813,7 @@ impl App {
         fs::rename(&tmp, &self.path)?;
 
         self.dirty = false;
-        let enabled = self.slots.iter().filter(|s| !self.slot_missing(s)).count();
-        self.status = match &self.current_profile {
-            Some(name) => match self.write_modlist(name) {
-                Ok(()) => format!(
-                    "Saved: {enabled} mods enabled + profile '{name}' (backup: {file_name}.bak)"
-                ),
-                Err(e) => format!("Saved mods, but updating profile '{name}' failed: {e:#}"),
-            },
-            None => format!("Saved: {enabled} mods enabled (backup: {file_name}.bak)"),
-        };
-        Ok(())
+        Ok(format!("{file_name}.bak"))
     }
 
     // -- profiles -----------------------------------------------------------
@@ -597,7 +848,7 @@ impl App {
             .map(String::as_str)
     }
 
-    fn read_modlist(name: &str) -> Result<Vec<String>> {
+    fn read_modlist(name: &str) -> Result<Vec<MlEntry>> {
         let path = modlists_dir().join(format!("{name}.json"));
         let text = fs::read_to_string(&path)
             .with_context(|| format!("could not read {}", path.display()))?;
@@ -609,8 +860,19 @@ impl App {
             .context("profile has no \"mods\" array")?;
         Ok(entries
             .iter()
-            .filter_map(|e| e.get("uuid").and_then(Value::as_str))
-            .map(String::from)
+            .filter_map(|e| {
+                Some(MlEntry {
+                    uuid: e.get("uuid").and_then(Value::as_str)?.to_string(),
+                    steam_id: e
+                        .get("steam_id")
+                        .and_then(Value::as_str)
+                        .map(String::from),
+                    manifest: e
+                        .get("manifest")
+                        .and_then(Value::as_str)
+                        .map(String::from),
+                })
+            })
             .collect())
     }
 
@@ -624,57 +886,104 @@ impl App {
         self.preview_for = name.clone();
         self.preview.clear();
         let Some(name) = name else { return };
-        for uuid in Self::read_modlist(&name).unwrap_or_default() {
+        for e in Self::read_modlist(&name).unwrap_or_default() {
             let known = self
                 .pool
                 .iter()
-                .find(|m| m.uuid().is_some_and(|u| u.eq_ignore_ascii_case(&uuid)));
+                .find(|m| m.uuid().is_some_and(|u| u.eq_ignore_ascii_case(&e.uuid)));
+            let updated = match (&known, &e.manifest) {
+                (Some(m), Some(pinned)) => m
+                    .steam_id
+                    .as_ref()
+                    .and_then(|sid| self.ws.get(sid))
+                    .is_some_and(|w| !w.manifest.is_empty() && &w.manifest != pinned),
+                _ => false,
+            };
             self.preview.push(match known {
                 Some(m) => PreviewLine {
                     label: m.name().to_string(),
                     missing: m.missing,
+                    updated,
                 },
                 None => PreviewLine {
-                    label: uuid,
+                    label: e.uuid,
                     missing: true,
+                    updated: false,
                 },
             });
         }
     }
 
-    fn write_modlist(&self, name: &str) -> Result<()> {
+    /// Write the profile with current version pins, vaulting each pinned
+    /// pack version that isn't vaulted yet. Returns how many pack
+    /// versions were newly vaulted.
+    fn write_modlist(&mut self, name: &str) -> Result<usize> {
         // Slots keep their uuid even when the mod is not installed, so
         // missing mods survive a rewrite.
-        let mods: Vec<Value> = self
-            .slots
-            .iter()
-            .map(|s| serde_json::json!({ "uuid": s.uuid, "active": true }))
-            .collect();
+        let mut vaulted = 0usize;
+        let mut mods: Vec<Value> = Vec::with_capacity(self.slots.len());
+        for s in &self.slots {
+            let mut o = serde_json::json!({ "uuid": s.uuid, "active": true });
+            if let Some(entry) = s.idx.map(|i| &self.pool[i]) {
+                if let Some(sid) = &entry.steam_id {
+                    o["steam_id"] = Value::from(sid.clone());
+                    if let Some(w) = self.ws.get(sid) {
+                        o["manifest"] = Value::from(w.manifest.clone());
+                        o["timeupdated"] = Value::from(w.timeupdated);
+                        o["size"] = Value::from(w.size);
+                        if vault_pack(entry, &w.manifest)? {
+                            vaulted += 1;
+                        }
+                    }
+                }
+            }
+            mods.push(o);
+        }
+        let root = serde_json::json!({
+            "saved_at": SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+            "game_buildid": self.game_buildid,
+            "mods": mods,
+        });
         let dir = modlists_dir();
         fs::create_dir_all(&dir)?;
-        let text = serde_json::to_string_pretty(&serde_json::json!({ "mods": mods }))?;
+        let text = serde_json::to_string_pretty(&root)?;
         fs::write(dir.join(format!("{name}.json")), text)?;
-        Ok(())
+        // The file now pins what's installed; refresh in-memory pins if
+        // it's the current profile.
+        if self.current_profile.as_deref() == Some(name) {
+            self.load_pins(name);
+        }
+        Ok(vaulted)
     }
 
     fn save_profile(&mut self, name: &str) -> Result<()> {
-        self.write_modlist(name)?;
         self.set_current(Some(name.to_string()));
-        self.status = format!("Saved profile '{name}' ({} mods)", self.slots.len());
+        let vaulted = self.write_modlist(name)?;
+        self.status = if vaulted > 0 {
+            format!(
+                "Saved profile '{name}' ({} mods, {vaulted} pack versions vaulted)",
+                self.slots.len()
+            )
+        } else {
+            format!("Saved profile '{name}' ({} mods)", self.slots.len())
+        };
         Ok(())
     }
 
     fn apply_profile(&mut self, name: &str) -> Result<()> {
-        let uuids = Self::read_modlist(name)?;
-        self.slots = uuids
+        let entries = Self::read_modlist(name)?;
+        self.slots = entries
             .into_iter()
-            .map(|uuid| {
+            .map(|e| {
                 let idx = self
                     .pool
                     .iter()
-                    .position(|m| m.uuid().is_some_and(|u| u.eq_ignore_ascii_case(&uuid)));
+                    .position(|m| m.uuid().is_some_and(|u| u.eq_ignore_ascii_case(&e.uuid)));
                 Slot {
-                    uuid: uuid.to_lowercase(),
+                    uuid: e.uuid.to_lowercase(),
                     idx,
                 }
             })
@@ -687,19 +996,112 @@ impl App {
         }
         self.dirty = true;
         self.set_current(Some(name.to_string()));
-        // Switching profiles takes effect immediately; no unsaved state
-        // to worry about afterwards.
-        self.save()?;
-        let note = if missing > 0 {
-            format!(", {missing} missing (kept in profile, not enabled)")
-        } else {
+        self.load_pins(name);
+        // Switching profiles takes effect immediately — but only the
+        // launcher file is written; the profile file (and its version
+        // pins) is left untouched so drift stays visible.
+        self.save_moddata()?;
+        let mut notes = Vec::new();
+        if missing > 0 {
+            notes.push(format!("{missing} missing (kept in profile, not enabled)"));
+        }
+        if let Some(drift) = self.drift_report() {
+            notes.push(drift);
+        }
+        let note = if notes.is_empty() {
             String::new()
+        } else {
+            format!(" — {}", notes.join("; "))
         };
         self.status = format!(
             "Switched to profile '{name}': {} mods{note}",
             self.slots.len()
         );
         Ok(())
+    }
+
+    // -- launching ----------------------------------------------------------
+
+    /// Generate used_mods.txt in the game dir from the load order. Mods
+    /// whose workshop copy was updated past the profile's pin use the
+    /// vaulted (pinned) version when it exists. Returns (mods, pinned).
+    fn write_used_mods(&self) -> Result<(usize, usize)> {
+        let game_dir = game_install_dir().context(
+            "could not find the game install dir (steamapps/common/Total War WARHAMMER III)",
+        )?;
+        let mut dirs: Vec<PathBuf> = Vec::new();
+        let mut mod_lines: Vec<String> = Vec::new();
+        let mut pinned = 0usize;
+        for s in &self.slots {
+            let Some(entry) = s.idx.map(|i| &self.pool[i]) else { continue };
+            if entry.missing {
+                continue;
+            }
+            let Some(live) = &entry.pack_path else { continue };
+            let path = if self.slot_updated(s) {
+                match self.pins.get(&s.uuid).and_then(|m| vaulted_pack(entry, m)) {
+                    Some(vaulted) => {
+                        pinned += 1;
+                        vaulted
+                    }
+                    None => live.clone(),
+                }
+            } else {
+                live.clone()
+            };
+            let Some(dir) = path.parent() else { continue };
+            let Some(fname) = path.file_name().and_then(|f| f.to_str()) else { continue };
+            if !dirs.iter().any(|d| d == dir) {
+                dirs.push(dir.to_path_buf());
+            }
+            mod_lines.push(format!("mod \"{fname}\";"));
+        }
+        let mut out = String::new();
+        for d in &dirs {
+            out.push_str(&format!("add_working_directory \"{}\";\n", unix_to_win(d)));
+        }
+        for l in &mod_lines {
+            out.push_str(l);
+            out.push('\n');
+        }
+        fs::write(game_dir.join("used_mods.txt"), out)
+            .with_context(|| format!("could not write used_mods.txt in {}", game_dir.display()))?;
+        Ok((mod_lines.len(), pinned))
+    }
+
+    /// Write used_mods.txt and ask Steam to start the game (Steam does
+    /// the Proton wrapping exactly as if launched from its UI).
+    fn launch(&mut self) {
+        if self.dirty {
+            self.status = "Unsaved changes — press s first, then L to launch".into();
+            return;
+        }
+        let (mods, pinned) = match self.write_used_mods() {
+            Ok(r) => r,
+            Err(e) => {
+                self.status = format!("Launch failed: {e:#}");
+                return;
+            }
+        };
+        match Command::new("steam")
+            .args(["-applaunch", &APPID.to_string()])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            Ok(_) => {
+                let pin_note = if pinned > 0 {
+                    format!(", {pinned} pinned from vault")
+                } else {
+                    String::new()
+                };
+                self.status = format!(
+                    "Launching via Steam: {mods} mods in used_mods.txt{pin_note} (see --help for the one-time launch options setup)"
+                );
+            }
+            Err(e) => self.status = format!("could not run steam: {e}"),
+        }
     }
 
     fn delete_profile(&mut self, name: &str) -> Result<()> {
@@ -884,7 +1286,14 @@ fn draw_profile(f: &mut Frame, app: &mut App, area: Rect) {
         .map(|(n, s)| {
             let (label, style) = match s.idx {
                 Some(i) if !app.pool[i].missing => {
-                    (app.pool[i].name().to_string(), Style::default())
+                    if app.slot_updated(s) {
+                        (
+                            format!("{} (updated)", app.pool[i].name()),
+                            Style::default().fg(Color::Yellow),
+                        )
+                    } else {
+                        (app.pool[i].name().to_string(), Style::default())
+                    }
                 }
                 Some(i) => (
                     format!("{} (missing)", app.pool[i].name()),
@@ -1110,6 +1519,9 @@ fn draw_profiles_popup(f: &mut Frame, app: &mut App) {
             if l.missing {
                 Line::from(format!("{:>3} {} (missing)", n + 1, l.label))
                     .style(Style::default().fg(Color::Red))
+            } else if l.updated {
+                Line::from(format!("{:>3} {} (updated)", n + 1, l.label))
+                    .style(Style::default().fg(Color::Yellow))
             } else {
                 Line::from(format!("{:>3} {}", n + 1, l.label))
             }
@@ -1195,6 +1607,7 @@ fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<()> {
                             app.status = format!("Save failed: {e:#}");
                         }
                     }
+                    KeyCode::Char('L') => app.launch(),
                     _ => {}
                 }
             }
@@ -1273,20 +1686,37 @@ fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<()> {
 fn usage() {
     println!(
         "twwh3-mods — TUI mod load-order manager for Total War: WARHAMMER III\n\n\
-         Usage: twwh3-mods [--list]\n\n\
+         Usage: twwh3-mods [--list | --launch]\n\n\
          Options:\n  \
            -l, --list   Print the load order and available mods, then exit\n  \
+           --launch     Write used_mods.txt and start the game via Steam\n  \
            -h, --help   Show this help\n\n\
          Keys:\n  \
            tab / h / l      switch pane   j/k or arrows        select\n  \
            space / enter    add to or remove from the load order\n  \
            J/K              reorder within the load order\n  \
            p                profiles (enter apply, n new, d delete)\n  \
-           s                save          q                    quit\n\n\
+           s                save          L launch          q  quit\n\n\
+         Launching (one-time setup):\n  \
+           L / --launch write used_mods.txt into the game folder and run\n  \
+           `steam -applaunch {APPID}` — Steam still does all the Proton work.\n  \
+           To make the game (and Steam's own Play button) skip the CA\n  \
+           launcher and use that exact file, set the game's Steam launch\n  \
+           options to:\n\n    \
+           twwh3-run %command%\n\n  \
+           (twwh3-run ships alongside this tool.) Without it, the CA\n  \
+           launcher opens as usual and uses the same mod list, minus\n  \
+           version pinning.\n\n\
+         Versioning:\n  \
+           Profiles pin each mod's Steam manifest (= exact version) and the\n  \
+           game build id at save time; the packs themselves are copied into\n  \
+           the vault. When Steam force-updates a mod, the load order marks\n  \
+           it '(updated)' and L loads the pinned version from the vault.\n\n\
          Environment:\n  \
            TWWH3_MODDATA   Path to the launcher moddata file (overrides everything)\n  \
            TWWH3_WORKSHOP  Workshop content dir to scan for new mods\n  \
            TWWH3_MODLISTS  Profile dir (default: ~/Games/TotalWarWH3/modlists)\n  \
+           TWWH3_VAULT     Pack version store (default: ~/Games/TotalWarWH3/vault)\n  \
            TWWH3_IMAGES    auto (default) | halfblocks | off\n  \
            STEAM_ROOT      Steam install root (default: ~/.local/share/Steam)"
     );
@@ -1298,29 +1728,45 @@ fn main() -> Result<()> {
         usage();
         return Ok(());
     }
-    if let Some(bad) = args.iter().find(|a| !matches!(a.as_str(), "-l" | "--list")) {
+    if let Some(bad) = args
+        .iter()
+        .find(|a| !matches!(a.as_str(), "-l" | "--list" | "--launch"))
+    {
         usage();
         bail!("unknown argument: {bad}");
+    }
+
+    if args.iter().any(|a| a == "--launch") {
+        let mut app = App::load(moddata_path(), None)?;
+        app.launch();
+        println!("{}", app.status);
+        return Ok(());
     }
 
     if !args.is_empty() {
         // --list: no terminal queries, no TUI.
         let app = App::load(moddata_path(), None)?;
-        println!("Load order:");
+        let mut out = String::from("Load order:\n");
         for (n, s) in app.slots.iter().enumerate() {
             let (name, note) = match s.idx {
-                Some(i) if !app.pool[i].missing => (app.pool[i].name(), ""),
+                Some(i) if !app.pool[i].missing => (
+                    app.pool[i].name(),
+                    if app.slot_updated(s) { "  (updated)" } else { "" },
+                ),
                 Some(i) => (app.pool[i].name(), "  (missing)"),
                 None => (s.uuid.as_str(), "  (missing)"),
             };
-            println!("{:>3}  {name}{note}", n + 1);
+            out.push_str(&format!("{:>3}  {name}{note}\n", n + 1));
         }
-        println!("\nAvailable:");
+        out.push_str("\nAvailable:\n");
         for i in app.available() {
             let m = &app.pool[i];
             let note = if m.discovered { "  (new)" } else { "" };
-            println!("     {}{note}", m.name());
+            out.push_str(&format!("     {}{note}\n", m.name()));
         }
+        // Ignore broken pipes from e.g. `--list | head`.
+        use std::io::Write;
+        let _ = std::io::stdout().write_all(out.as_bytes());
         return Ok(());
     }
 
