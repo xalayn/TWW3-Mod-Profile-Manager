@@ -6,10 +6,37 @@
 set -euo pipefail
 
 APPID=1142710
+
+# Shared config file (same one twwh3-mods reads): `key = value` lines.
+# Env vars win over the config file, defaults fill the rest.
+CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/twwh3-mods/config"
+
+cfg() {
+  [ -f "$CONFIG_FILE" ] || return 0
+  sed -n -E "s/^[[:space:]]*$1[[:space:]]*=[[:space:]]*[\"']?([^\"'#]*)[\"']?[[:space:]]*\$/\1/p" \
+    "$CONFIG_FILE" | tail -n1
+}
+
+# Expand a literal leading ~/ in config values (the shell doesn't expand
+# tildes read from files).
+# shellcheck disable=SC2088
+expand_tilde() {
+  local v="${1:-}"
+  case "$v" in
+    "~/"*) printf '%s' "$HOME/${v#??}" ;;
+    *) printf '%s' "$v" ;;
+  esac
+}
+
+STEAM_ROOT="${STEAM_ROOT:-$(expand_tilde "$(cfg steam_root)")}"
 STEAM_ROOT="${STEAM_ROOT:-$HOME/.local/share/Steam}"
+DATA_DIR="${TWWH3_DATA:-$(expand_tilde "$(cfg data_dir)")}"
+DATA_DIR="${DATA_DIR:-$HOME/Games/TotalWarWH3}"
+PROFILES="${TWWH3_PROFILES:-$(expand_tilde "$(cfg snapshots)")}"
+PROFILES="${PROFILES:-$DATA_DIR/profiles}"
+
 PREFIX="$STEAM_ROOT/steamapps/compatdata/$APPID/pfx/drive_c/users/steamuser"
 ROAMING="$PREFIX/AppData/Roaming/The Creative Assembly"
-PROFILES="${TWWH3_PROFILES:-$HOME/Games/TotalWarWH3/profiles}"
 
 die() { echo "Error: $*" >&2; exit 1; }
 
@@ -24,9 +51,13 @@ Commands:
   delete <name>   Delete a saved profile
   help            Show this help
 
-Environment:
-  STEAM_ROOT      Steam install root (default: ~/.local/share/Steam)
-  TWWH3_PROFILES  Profile storage dir (default: ~/Games/TotalWarWH3/profiles)
+Configuration (~/.config/twwh3-mods/config, shared with twwh3-mods):
+  steam_root      Steam library containing the game
+  data_dir        Base data dir (default: ~/Games/TotalWarWH3)
+  snapshots       Snapshot storage dir (default: <data_dir>/profiles)
+
+Environment (overrides config):
+  STEAM_ROOT, TWWH3_DATA, TWWH3_PROFILES
 EOF
 }
 

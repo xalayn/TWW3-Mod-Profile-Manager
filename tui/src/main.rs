@@ -36,39 +36,90 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const APPID: u32 = 1142710;
 const GAME: &str = "warhammer3";
 
 // ---------------------------------------------------------------------------
-// Paths
+// Configuration & paths
+//
+// Every path resolves in order: environment variable, config file,
+// default. The config file is ~/.config/twwh3-mods/config with
+// `key = value` lines, `#` comments, optional quotes, and `~/` expansion.
 
-fn moddata_path() -> PathBuf {
-    if let Ok(p) = env::var("TWWH3_MODDATA") {
-        return PathBuf::from(p);
+fn home() -> PathBuf {
+    PathBuf::from(env::var("HOME").unwrap_or_else(|_| ".".into()))
+}
+
+fn config_file() -> PathBuf {
+    env::var("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| home().join(".config"))
+        .join("twwh3-mods/config")
+}
+
+static CONFIG: OnceLock<HashMap<String, String>> = OnceLock::new();
+
+fn config() -> &'static HashMap<String, String> {
+    CONFIG.get_or_init(|| {
+        let mut map = HashMap::new();
+        if let Ok(text) = fs::read_to_string(config_file()) {
+            for line in text.lines() {
+                let line = line.trim();
+                if line.is_empty() || line.starts_with('#') {
+                    continue;
+                }
+                if let Some((k, v)) = line.split_once('=') {
+                    let v = v.trim().trim_matches('"').trim_matches('\'');
+                    map.insert(k.trim().to_string(), v.to_string());
+                }
+            }
+        }
+        map
+    })
+}
+
+/// Env var wins over the config file.
+fn setting(env_key: &str, conf_key: &str) -> Option<String> {
+    env::var(env_key)
+        .ok()
+        .or_else(|| config().get(conf_key).cloned())
+}
+
+fn expand_path(v: &str) -> PathBuf {
+    match v.strip_prefix("~/") {
+        Some(rest) => home().join(rest),
+        None => PathBuf::from(v),
     }
-    steam_root().join(format!(
-        "steamapps/compatdata/{APPID}/pfx/drive_c/users/steamuser/\
-         AppData/Roaming/The Creative Assembly/Launcher/20190104-moddata.dat"
-    ))
+}
+
+fn path_setting(env_key: &str, conf_key: &str) -> Option<PathBuf> {
+    setting(env_key, conf_key).map(|v| expand_path(&v))
 }
 
 fn steam_root() -> PathBuf {
-    env::var("STEAM_ROOT")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            PathBuf::from(env::var("HOME").unwrap_or_else(|_| ".".into()))
-                .join(".local/share/Steam")
-        })
+    path_setting("STEAM_ROOT", "steam_root")
+        .unwrap_or_else(|| home().join(".local/share/Steam"))
+}
+
+/// Base dir for this tool's own data (profiles, vault, local mods).
+fn data_dir() -> PathBuf {
+    path_setting("TWWH3_DATA", "data_dir").unwrap_or_else(|| home().join("Games/TotalWarWH3"))
+}
+
+fn moddata_path() -> PathBuf {
+    path_setting("TWWH3_MODDATA", "moddata").unwrap_or_else(|| {
+        steam_root().join(format!(
+            "steamapps/compatdata/{APPID}/pfx/drive_c/users/steamuser/\
+             AppData/Roaming/The Creative Assembly/Launcher/20190104-moddata.dat"
+        ))
+    })
 }
 
 fn modlists_dir() -> PathBuf {
-    if let Ok(p) = env::var("TWWH3_MODLISTS") {
-        return PathBuf::from(p);
-    }
-    PathBuf::from(env::var("HOME").unwrap_or_else(|_| ".".into()))
-        .join("Games/TotalWarWH3/modlists")
+    path_setting("TWWH3_MODLISTS", "modlists").unwrap_or_else(|| data_dir().join("modlists"))
 }
 
 /// Remembers which profile is current across restarts.
@@ -77,19 +128,18 @@ fn current_profile_file() -> PathBuf {
 }
 
 fn workshop_dir() -> PathBuf {
-    if let Ok(p) = env::var("TWWH3_WORKSHOP") {
-        return PathBuf::from(p);
-    }
-    steam_root().join(format!("steamapps/workshop/content/{APPID}"))
+    path_setting("TWWH3_WORKSHOP", "workshop")
+        .unwrap_or_else(|| steam_root().join(format!("steamapps/workshop/content/{APPID}")))
+}
+
+/// Drop .pack files here to use mods from outside the Steam Workshop.
+fn local_mods_dir() -> PathBuf {
+    path_setting("TWWH3_LOCAL", "local_mods").unwrap_or_else(|| data_dir().join("mods"))
 }
 
 /// Local store of past mod versions: vault/<steam_id>/<manifest>/<pack>.
 fn vault_dir() -> PathBuf {
-    if let Ok(p) = env::var("TWWH3_VAULT") {
-        return PathBuf::from(p);
-    }
-    PathBuf::from(env::var("HOME").unwrap_or_else(|_| ".".into()))
-        .join("Games/TotalWarWH3/vault")
+    path_setting("TWWH3_VAULT", "vault").unwrap_or_else(|| data_dir().join("vault"))
 }
 
 /// Convert a wine path like "Z:/home/x/y.pack" to a unix path.
@@ -200,6 +250,9 @@ fn load_game_buildid() -> Option<String> {
 }
 
 fn game_install_dir() -> Option<PathBuf> {
+    if let Some(dir) = path_setting("TWWH3_GAME", "game_dir") {
+        return dir.is_dir().then_some(dir);
+    }
     let path = steam_root().join(format!("steamapps/appmanifest_{APPID}.acf"));
     let installdir = vdf_str(&fs::read_to_string(path).ok()?, "installdir")?;
     let dir = steam_root().join("steamapps/common").join(installdir);
@@ -224,6 +277,8 @@ struct ModEntry {
     thumb: Thumb,
     /// Found on disk but not yet known to the launcher.
     discovered: bool,
+    /// From the local mods dir rather than the Steam Workshop.
+    local: bool,
     /// Pack file no longer exists on disk (unsubscribed / not downloaded).
     missing: bool,
 }
@@ -264,6 +319,7 @@ impl ModEntry {
             png,
             thumb: Thumb::NotLoaded,
             discovered: false,
+            local: false,
             missing,
         }
     }
@@ -358,6 +414,49 @@ fn discover_workshop_mods(mods: &mut Vec<ModEntry>) {
             e.discovered = true;
             found.push(e);
         }
+    }
+    found.sort_by(|a, b| a.name().to_lowercase().cmp(&b.name().to_lowercase()));
+    mods.extend(found);
+}
+
+/// Scan the local mods dir for .pack files (mods from outside the
+/// Steam Workshop) and append them as entries.
+fn discover_local_mods(mods: &mut Vec<ModEntry>) {
+    let dir = local_mods_dir();
+    let _ = fs::create_dir_all(&dir);
+    let known: HashSet<String> = mods
+        .iter()
+        .filter_map(|m| m.uuid())
+        .map(str::to_lowercase)
+        .collect();
+    let Ok(files) = fs::read_dir(&dir) else { return };
+    let mut found: Vec<ModEntry> = Vec::new();
+    for f in files.flatten() {
+        let p = f.path();
+        if !p.extension().is_some_and(|e| e.eq_ignore_ascii_case("pack")) {
+            continue;
+        }
+        let Some(fname) = p.file_name().and_then(|s| s.to_str()) else { continue };
+        let uuid = fname.to_lowercase();
+        if known.contains(&uuid) {
+            continue;
+        }
+        let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or(fname);
+        let data = serde_json::json!({
+            "uuid": uuid,
+            "order": 0,
+            "active": false,
+            "game": GAME,
+            "packfile": format!("Z:{}", p.display()),
+            "name": stem,
+            "short": "",
+            "category": "",
+            "owned": true,
+        });
+        let mut e = ModEntry::new(data);
+        e.discovered = true;
+        e.local = true;
+        found.push(e);
     }
     found.sort_by(|a, b| a.name().to_lowercase().cmp(&b.name().to_lowercase()));
     mods.extend(found);
@@ -503,6 +602,16 @@ impl App {
         wh3.sort_by_key(|m| m.get("order").and_then(Value::as_i64).unwrap_or(i64::MAX));
         let mut pool: Vec<ModEntry> = wh3.into_iter().map(ModEntry::new).collect();
         discover_workshop_mods(&mut pool);
+        discover_local_mods(&mut pool);
+        // Entries the launcher already adopted from the local dir.
+        for m in &mut pool {
+            if !m.local {
+                m.local = m
+                    .pack_path
+                    .as_ref()
+                    .is_some_and(|p| p.starts_with(local_mods_dir()));
+            }
+        }
 
         // Initial load order: the launcher's active mods, in its order.
         let slots: Vec<Slot> = pool
@@ -1251,7 +1360,9 @@ fn draw_available(f: &mut Frame, app: &mut App, area: Rect) {
         .iter()
         .map(|&i| {
             let m = &app.pool[i];
-            let name_style = if m.discovered {
+            let name_style = if m.local {
+                Style::default().fg(Color::Magenta)
+            } else if m.discovered {
                 Style::default().fg(Color::Green)
             } else {
                 Style::default()
@@ -1443,6 +1554,12 @@ fn draw_side_panel(f: &mut Frame, app: &mut App, area: Rect) {
             1,
             Line::from("missing — pack file not found (unsubscribed or not downloaded)")
                 .style(Style::default().fg(Color::Red)),
+        );
+    } else if entry.local {
+        lines.insert(
+            1,
+            Line::from("local mod — loaded from the local mods dir, not Steam Workshop")
+                .style(Style::default().fg(Color::Magenta)),
         );
     } else if entry.discovered {
         lines.insert(
@@ -1686,10 +1803,11 @@ fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<()> {
 fn usage() {
     println!(
         "twwh3-mods — TUI mod load-order manager for Total War: WARHAMMER III\n\n\
-         Usage: twwh3-mods [--list | --launch]\n\n\
+         Usage: twwh3-mods [--list | --launch | --paths]\n\n\
          Options:\n  \
            -l, --list   Print the load order and available mods, then exit\n  \
            --launch     Write used_mods.txt and start the game via Steam\n  \
+           --paths      Print every resolved path and where config is read from\n  \
            -h, --help   Show this help\n\n\
          Keys:\n  \
            tab / h / l      switch pane   j/k or arrows        select\n  \
@@ -1707,18 +1825,29 @@ fn usage() {
            (twwh3-run ships alongside this tool.) Without it, the CA\n  \
            launcher opens as usual and uses the same mod list, minus\n  \
            version pinning.\n\n\
+         Local (non-Workshop) mods:\n  \
+           Drop .pack files into ~/Games/TotalWarWH3/mods (TWWH3_LOCAL) and\n  \
+           they appear under Available, marked 'local'. They load from that\n  \
+           folder directly — no need to copy them into the game's data dir.\n\n\
          Versioning:\n  \
            Profiles pin each mod's Steam manifest (= exact version) and the\n  \
            game build id at save time; the packs themselves are copied into\n  \
            the vault. When Steam force-updates a mod, the load order marks\n  \
            it '(updated)' and L loads the pinned version from the vault.\n\n\
-         Environment:\n  \
-           TWWH3_MODDATA   Path to the launcher moddata file (overrides everything)\n  \
-           TWWH3_WORKSHOP  Workshop content dir to scan for new mods\n  \
-           TWWH3_MODLISTS  Profile dir (default: ~/Games/TotalWarWH3/modlists)\n  \
-           TWWH3_VAULT     Pack version store (default: ~/Games/TotalWarWH3/vault)\n  \
-           TWWH3_IMAGES    auto (default) | halfblocks | off\n  \
-           STEAM_ROOT      Steam install root (default: ~/.local/share/Steam)"
+         Configuration (~/.config/twwh3-mods/config, `key = value` lines):\n  \
+           steam_root  Steam library containing the game (default: ~/.local/share/Steam)\n  \
+           data_dir    Base for this tool's data (default: ~/Games/TotalWarWH3)\n  \
+           modlists    Profiles          (default: <data_dir>/modlists)\n  \
+           vault       Pinned versions   (default: <data_dir>/vault)\n  \
+           local_mods  Non-Workshop mods (default: <data_dir>/mods)\n  \
+           moddata     Launcher mod list file    (default: derived from steam_root)\n  \
+           workshop    Workshop content dir      (default: derived from steam_root)\n  \
+           game_dir    Game install dir          (default: derived from steam_root)\n  \
+           images      auto (default) | halfblocks | off\n\n  \
+           Each key also has an env var that overrides it: STEAM_ROOT,\n  \
+           TWWH3_DATA, TWWH3_MODLISTS, TWWH3_VAULT, TWWH3_LOCAL,\n  \
+           TWWH3_MODDATA, TWWH3_WORKSHOP, TWWH3_GAME, TWWH3_IMAGES.\n  \
+           Run `twwh3-mods --paths` to see the resolved values."
     );
 }
 
@@ -1730,10 +1859,32 @@ fn main() -> Result<()> {
     }
     if let Some(bad) = args
         .iter()
-        .find(|a| !matches!(a.as_str(), "-l" | "--list" | "--launch"))
+        .find(|a| !matches!(a.as_str(), "-l" | "--list" | "--launch" | "--paths"))
     {
         usage();
         bail!("unknown argument: {bad}");
+    }
+
+    if args.iter().any(|a| a == "--paths") {
+        let cfg = config_file();
+        let cfg_note = if cfg.exists() { "" } else { "  (not present)" };
+        println!("config file:  {}{cfg_note}", cfg.display());
+        println!("steam_root:   {}", steam_root().display());
+        println!("data_dir:     {}", data_dir().display());
+        println!("moddata:      {}", moddata_path().display());
+        println!("workshop:     {}", workshop_dir().display());
+        match game_install_dir() {
+            Some(d) => println!("game_dir:     {}", d.display()),
+            None => println!("game_dir:     (not found)"),
+        }
+        println!("modlists:     {}", modlists_dir().display());
+        println!("vault:        {}", vault_dir().display());
+        println!("local_mods:   {}", local_mods_dir().display());
+        println!(
+            "images:       {}",
+            setting("TWWH3_IMAGES", "images").unwrap_or_else(|| "auto".into())
+        );
+        return Ok(());
     }
 
     if args.iter().any(|a| a == "--launch") {
@@ -1761,7 +1912,13 @@ fn main() -> Result<()> {
         out.push_str("\nAvailable:\n");
         for i in app.available() {
             let m = &app.pool[i];
-            let note = if m.discovered { "  (new)" } else { "" };
+            let note = if m.local {
+                "  (local)"
+            } else if m.discovered {
+                "  (new)"
+            } else {
+                ""
+            };
             out.push_str(&format!("     {}{note}\n", m.name()));
         }
         // Ignore broken pipes from e.g. `--list | head`.
@@ -1776,9 +1933,9 @@ fn main() -> Result<()> {
     // TWWH3_IMAGES=halfblocks or =off skips the query: if a terminal never
     // answers it, ratatui-image leaks a reader thread that steals
     // keystrokes from the TUI for the rest of the session.
-    let picker = match env::var("TWWH3_IMAGES").as_deref() {
-        Ok("off") => None,
-        Ok("halfblocks") => Some(Picker::from_fontsize((8, 16))),
+    let picker = match setting("TWWH3_IMAGES", "images").as_deref() {
+        Some("off") => None,
+        Some("halfblocks") => Some(Picker::from_fontsize((8, 16))),
         _ => Some(Picker::from_query_stdio().unwrap_or_else(|_| Picker::from_fontsize((8, 16)))),
     };
     let mut app = App::load(moddata_path(), picker)?;

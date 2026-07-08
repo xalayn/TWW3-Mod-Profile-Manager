@@ -1,0 +1,33 @@
+# twwh3-mods / twwh3-profile configuration
+#
+# Copy to ~/.config/twwh3-mods/config and uncomment what you want to
+# change. `key = value` lines; `~/` expands to your home directory.
+# Environment variables (STEAM_ROOT, TWWH3_DATA, ...) override this file.
+
+# Steam library that contains the game (also where the Proton prefix and
+# workshop content are looked up).
+#steam_root = ~/.local/share/Steam
+
+# Base directory for this tool's own data. The next three default to
+# subdirectories of it.
+#data_dir = ~/Games/TotalWarWH3
+
+# Mod-list profiles (twwh3-mods).
+#modlists = ~/Games/TotalWarWH3/modlists
+
+# Vaulted pack versions for update pinning (twwh3-mods).
+#vault = ~/Games/TotalWarWH3/vault
+
+# Drop .pack files here to use mods from outside the Steam Workshop.
+#local_mods = ~/Games/TotalWarWH3/mods
+
+# Full-folder snapshots (twwh3-profile).
+#snapshots = ~/Games/TotalWarWH3/profiles
+
+# Only needed for unusual setups — normally derived from steam_root:
+#moddata = ~/.local/share/Steam/steamapps/compatdata/1142710/pfx/drive_c/users/steamuser/AppData/Roaming/The Creative Assembly/Launcher/20190104-moddata.dat
+#workshop = ~/.local/share/Steam/steamapps/workshop/content/1142710
+#game_dir = ~/.local/share/Steam/steamapps/common/Total War WARHAMMER III
+
+# Thumbnail rendering: auto (query the terminal), halfblocks, or off.
+#images = auto
