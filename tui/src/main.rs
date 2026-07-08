@@ -2,7 +2,7 @@
 //!
 //! A mod is a *folder* that gets mirrored into the game's data/ at launch:
 //! a Steam Workshop item dir (workshop/content/<appid>/<steam_id>/) or a
-//! local mod dir (mods/<name>/). Either may hold several .pack files plus
+//! local mod dir (local_mods/<name>/). Either may hold several .pack files plus
 //! loose assets (movies, tables); the packs are listed in used_mods, the
 //! whole folder rides along via the overlay. Local mods are first-class —
 //! you don't need Steam Workshop at all.
@@ -108,7 +108,7 @@ fn steam_root() -> PathBuf {
         .unwrap_or_else(|| home().join(".local/share/Steam"))
 }
 
-/// Base dir for this tool's own data (profiles, vault, local mods).
+/// Base dir for this tool's own data (profiles, versioned mods, local mods).
 fn data_dir() -> PathBuf {
     path_setting("TWWH3_DATA", "data_dir").unwrap_or_else(|| home().join("Games/TotalWarWH3"))
 }
@@ -136,15 +136,35 @@ fn workshop_dir() -> PathBuf {
         .unwrap_or_else(|| steam_root().join(format!("steamapps/workshop/content/{APPID}")))
 }
 
-/// Put a subfolder here per local (non-Workshop) mod: mods/<name>/ holding
-/// its .pack file(s) and any loose assets, mirrored into the game's data/.
+/// Put a subfolder here per local (non-Workshop) mod:
+/// local_mods/<name>/ holding its .pack file(s) and any loose assets,
+/// mirrored into the game's data/.
 fn local_mods_dir() -> PathBuf {
-    path_setting("TWWH3_LOCAL", "local_mods").unwrap_or_else(|| data_dir().join("mods"))
+    if let Some(p) = path_setting("TWWH3_LOCAL", "local_mods") {
+        return p;
+    }
+    let dir = data_dir().join("local_mods");
+    // One-time migration from the old default name ("mods").
+    let old = data_dir().join("mods");
+    if !dir.exists() && old.is_dir() {
+        let _ = fs::rename(&old, &dir);
+    }
+    dir
 }
 
-/// Local store of past mod versions: vault/<steam_id>/<manifest>/<pack>.
-fn vault_dir() -> PathBuf {
-    path_setting("TWWH3_VAULT", "vault").unwrap_or_else(|| data_dir().join("vault"))
+/// Local store of exact Steam Workshop mod versions, keyed by workshop id
+/// and manifest: versioned_workshop_mods/<steam_id>/<manifest>/<files>.
+fn versioned_mods_dir() -> PathBuf {
+    if let Some(p) = path_setting("TWWH3_VERSIONED_WORKSHOP_MODS", "versioned_workshop_mods") {
+        return p;
+    }
+    let dir = data_dir().join("versioned_workshop_mods");
+    // One-time migration from the old default name ("vault").
+    let old = data_dir().join("vault");
+    if !dir.exists() && old.is_dir() {
+        let _ = fs::rename(&old, &dir);
+    }
+    dir
 }
 
 /// Staging folder: the load order materialized as one symlink per pack,
@@ -282,7 +302,7 @@ enum Thumb {
 
 /// A mod is a folder mirrored into the game's data/: a Steam Workshop
 /// item dir (workshop/content/<appid>/<steam_id>/) or a local mod dir
-/// (mods/<name>/). Either may hold several .pack files (+ loose assets
+/// (local_mods/<name>/). Either may hold several .pack files (+ loose assets
 /// for local mods).
 struct ModEntry {
     /// The mod's folder on disk.
@@ -400,20 +420,6 @@ impl ModEntry {
         }
     }
 
-    /// The mod's files to mirror into data/, as (relative path, source).
-    /// Workshop mods mirror only their packs (flat, at data/ root); local
-    /// mods mirror their whole folder tree so loose assets travel too.
-    fn files(&self) -> Vec<(PathBuf, PathBuf)> {
-        if self.local {
-            walk_files(&self.dir)
-        } else {
-            self.packs
-                .iter()
-                .filter_map(|p| Some((PathBuf::from(p.file_name()?), p.clone())))
-                .collect()
-        }
-    }
-
     /// Description snippet with BBCode-style [tags] stripped.
     fn description(&self) -> String {
         let mut out = String::with_capacity(self.short.len());
@@ -523,41 +529,38 @@ fn discover_mods(meta: &HashMap<String, ModMeta>) -> Vec<ModEntry> {
     pool
 }
 
-/// Copy all of a Workshop mod's packs (+ preview) into
-/// vault/<sid>/<manifest>/, skipping any already present. Records a
-/// sha256 sidecar per pack. Returns how many packs were newly vaulted.
-fn vault_mod(sid: &str, manifest: &str, packs: &[PathBuf], png: Option<&Path>) -> Result<usize> {
+/// Copy a Workshop mod's whole folder (packs, preview, any loose files)
+/// into vault/<sid>/<manifest>/, skipping files already present, so the
+/// vaulted version is a faithful copy that survives unsubscribe. Records
+/// a sha256 sidecar per pack. Returns how many packs were newly vaulted.
+fn store_mod_version(sid: &str, manifest: &str, dir: &Path) -> Result<usize> {
     if manifest.is_empty() {
         return Ok(0);
     }
-    let dst_dir = vault_dir().join(sid).join(manifest);
+    let dst_dir = versioned_mods_dir().join(sid).join(manifest);
     let mut n = 0usize;
-    for pack in packs {
-        if !pack.exists() {
-            continue;
-        }
-        let Some(fname) = pack.file_name() else { continue };
-        let dst = dst_dir.join(fname);
+    for (rel, src) in walk_files(dir) {
+        let dst = dst_dir.join(&rel);
         if dst.exists() {
             continue;
         }
-        fs::create_dir_all(&dst_dir)
-            .with_context(|| format!("could not create {}", dst_dir.display()))?;
-        // Copy to a temp name first so an interrupted copy can't be
-        // mistaken for a complete vaulted version.
-        let tmp = dst_dir.join(format!(".{}.tmp", fname.to_string_lossy()));
-        fs::copy(pack, &tmp).with_context(|| format!("could not vault {}", pack.display()))?;
-        fs::rename(&tmp, &dst)?;
-        // Record a content hash beside the pack so a version can be
-        // verified independently of Steam (used when importing a bundle).
-        if let Some(hash) = pack_sha256(&dst) {
-            let _ = fs::write(sha256_sidecar(&dst), hash);
+        if let Some(parent) = dst.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("could not create {}", parent.display()))?;
         }
-        n += 1;
-    }
-    if let Some(png) = png {
-        if let Some(png_name) = png.file_name() {
-            let _ = fs::copy(png, dst_dir.join(png_name));
+        let fname = rel.file_name().and_then(|s| s.to_str()).unwrap_or("f");
+        // Copy to a temp name first so an interrupted copy can't be
+        // mistaken for a complete vaulted file.
+        let tmp = dst.with_file_name(format!(".{fname}.tmp"));
+        fs::copy(&src, &tmp).with_context(|| format!("could not vault {}", src.display()))?;
+        fs::rename(&tmp, &dst)?;
+        if src.extension().is_some_and(|e| e.eq_ignore_ascii_case("pack")) {
+            // A content hash beside the pack lets a version be verified
+            // independently of Steam (used when importing a bundle).
+            if let Some(hash) = pack_sha256(&dst) {
+                let _ = fs::write(sha256_sidecar(&dst), hash);
+            }
+            n += 1;
         }
     }
     Ok(n)
@@ -592,7 +595,7 @@ fn sha256_sidecar(pack: &Path) -> PathBuf {
 }
 
 /// The `.pack` file inside a vault version directory, if any.
-fn find_vault_pack(dir: &Path) -> Option<PathBuf> {
+fn find_stored_pack(dir: &Path) -> Option<PathBuf> {
     fs::read_dir(dir)
         .ok()?
         .flatten()
@@ -668,9 +671,9 @@ fn rebuild_staging(staging: &Path, entries: &[(PathBuf, PathBuf)]) -> Result<()>
 }
 
 /// Where a specific vaulted pack version lives, if it exists.
-fn vaulted_pack_path(sid: &str, manifest: &str, pack: &Path) -> Option<PathBuf> {
+fn stored_pack_path(sid: &str, manifest: &str, pack: &Path) -> Option<PathBuf> {
     let fname = pack.file_name()?;
-    let p = vault_dir().join(sid).join(manifest).join(fname);
+    let p = versioned_mods_dir().join(sid).join(manifest).join(fname);
     p.exists().then_some(p)
 }
 
@@ -717,10 +720,10 @@ fn launch_options_use_shim() -> Option<bool> {
 }
 
 /// (vaulted versions, total bytes) across the whole vault.
-fn vault_stats() -> (usize, u64) {
+fn versioned_mods_stats() -> (usize, u64) {
     let mut versions = 0usize;
     let mut bytes = 0u64;
-    for id_dir in fs::read_dir(vault_dir()).into_iter().flatten().flatten() {
+    for id_dir in fs::read_dir(versioned_mods_dir()).into_iter().flatten().flatten() {
         for man_dir in fs::read_dir(id_dir.path()).into_iter().flatten().flatten() {
             if !man_dir.path().is_dir() {
                 continue;
@@ -1010,10 +1013,10 @@ enum PackSource {
 impl PackSource {
     fn label(self) -> &'static str {
         match self {
-            PackSource::Vault => "vault",
-            PackSource::Pinned => "vault (pinned)",
+            PackSource::Vault => "versioned",
+            PackSource::Pinned => "versioned (pinned)",
             PackSource::Local => "local",
-            PackSource::Workshop => "workshop (not vaulted)",
+            PackSource::Workshop => "workshop (live)",
         }
     }
 }
@@ -1245,7 +1248,7 @@ impl App {
             ));
         }
         Some(format!(
-            "Since '{name}' was saved: {} — L launches with pinned versions where vaulted",
+            "Since '{name}' was saved: {} — L launches with pinned versions where stored",
             parts.join("; ")
         ))
     }
@@ -1265,8 +1268,8 @@ impl App {
             None => v.push(StatusLine::new("game", "not found — set game_dir in the config", Some(false))),
         }
         v.push(path_line("profiles", &modlists_dir(), "(created on first save)", None));
-        v.push(path_line("vault", &vault_dir(), "(created on first save)", None));
-        v.push(path_line("local mods", &local_mods_dir(), "(create it and drop .pack files in)", None));
+        v.push(path_line("versioned mods", &versioned_mods_dir(), "(created on first save)", None));
+        v.push(path_line("local mods", &local_mods_dir(), "(one subfolder per mod)", None));
         v.push(path_line("staging", &staging_dir(), "(created on first launch)", None));
         if let Some(g) = &game {
             v.push(path_line("used_mods.txt", &g.join("used_mods.txt"), "(written when you press L)", None));
@@ -1356,7 +1359,7 @@ impl App {
             lo.push_str(&format!(", {missing} missing"));
         }
         if updated > 0 {
-            lo.push_str(&format!(", {updated} updated past their pin (vault used at launch)"));
+            lo.push_str(&format!(", {updated} updated past their pin (stored version used at launch)"));
         }
         v.push(StatusLine::new("load order", lo, Some(missing == 0)));
         if self.dirty {
@@ -1373,9 +1376,9 @@ impl App {
             pool.push_str(&format!(", {local} local"));
         }
         v.push(StatusLine::new("mod pool", pool, None));
-        let (versions, bytes) = vault_stats();
+        let (versions, bytes) = versioned_mods_stats();
         v.push(StatusLine::new(
-            "vault",
+            "versioned mods",
             format!("{versions} pack versions, {}", human_size(bytes)),
             None,
         ));
@@ -1522,7 +1525,7 @@ impl App {
         let enabled = self.slots.iter().filter(|s| !self.slot_missing(s)).count();
         self.status = match self.write_modlist(&name) {
             Ok(vaulted) if vaulted > 0 => {
-                format!("Saved '{name}': {enabled} mods, {vaulted} pack versions vaulted")
+                format!("Saved '{name}': {enabled} mods, {vaulted} pack versions stored")
             }
             Ok(_) => format!("Saved '{name}': {enabled} mods"),
             Err(e) => format!("Saving '{name}' failed: {e:#}"),
@@ -1644,11 +1647,11 @@ impl App {
                         o["manifest"] = Value::from(w.manifest.clone());
                         o["timeupdated"] = Value::from(w.timeupdated);
                         o["size"] = Value::from(w.size);
-                        vaulted += vault_mod(sid, &w.manifest, &entry.packs, entry.png.as_deref())?;
+                        vaulted += store_mod_version(sid, &w.manifest, &entry.dir)?;
                         if let Some(hash) = entry
                             .packs
                             .first()
-                            .and_then(|p| vaulted_pack_path(sid, &w.manifest, p))
+                            .and_then(|p| stored_pack_path(sid, &w.manifest, p))
                             .and_then(|vp| read_or_make_sha256(&vp))
                         {
                             o["sha256"] = Value::from(hash);
@@ -1745,31 +1748,26 @@ impl App {
                 .iter()
                 .filter_map(|p| p.file_name()?.to_str().map(String::from))
                 .collect();
-            if entry.local {
-                out.push(ResolvedMod {
-                    name: entry.name().to_string(),
-                    source: PackSource::Local,
-                    files: entry.files(),
-                    packs,
-                    idx,
-                    manifest: None,
-                });
-                continue;
-            }
-            // Workshop: pick the version (pinned or current) and mirror its
-            // packs (flat, at data/ root) from the vault.
+            // Both kinds mirror their whole folder into data/ (packs +
+            // preview + any loose files, at matching relative paths). The
+            // file list comes from the mod folder; for Workshop mods each
+            // file is served from the vault (pinned/current version) so a
+            // launch never needs the live workshop folder, for local mods
+            // from the folder itself.
+            let (manifest, source) = if entry.local {
+                (None, PackSource::Local)
+            } else {
+                self.workshop_source(entry, s)
+            };
             let sid = entry.steam_id.clone().unwrap_or_default();
-            let (manifest, source) = self.workshop_source(entry, s);
-            let files: Vec<(PathBuf, PathBuf)> = entry
-                .packs
-                .iter()
-                .filter_map(|live| {
-                    let name = live.file_name()?;
+            let files: Vec<(PathBuf, PathBuf)> = walk_files(&entry.dir)
+                .into_iter()
+                .map(|(rel, live)| {
                     let src = match &manifest {
-                        Some(m) => vault_dir().join(&sid).join(m).join(name),
-                        None => live.clone(),
+                        Some(m) => versioned_mods_dir().join(&sid).join(m).join(&rel),
+                        None => live,
                     };
-                    Some((PathBuf::from(name), src))
+                    (rel, src)
                 })
                 .collect();
             out.push(ResolvedMod {
@@ -1791,7 +1789,7 @@ impl App {
         let sid = entry.steam_id.as_deref().unwrap_or("");
         if self.slot_updated(s) {
             if let Some(pin) = self.pins.get(&s.id) {
-                if vault_dir().join(sid).join(pin).is_dir() {
+                if versioned_mods_dir().join(sid).join(pin).is_dir() {
                     return (Some(pin.clone()), PackSource::Pinned);
                 }
             }
@@ -1843,7 +1841,7 @@ impl App {
             if r.source == PackSource::Vault {
                 let e = &self.pool[r.idx];
                 if let (Some(sid), Some(m)) = (&e.steam_id, &r.manifest) {
-                    let _ = vault_mod(sid, m, &e.packs, e.png.as_deref());
+                    let _ = store_mod_version(sid, m, &e.dir);
                 }
             }
         }
@@ -1943,7 +1941,7 @@ impl App {
         {
             Ok(_) => {
                 let pin_note = if pinned > 0 {
-                    format!(", {pinned} pinned from vault")
+                    format!(", {pinned} pinned versions")
                 } else {
                     String::new()
                 };
@@ -2121,7 +2119,7 @@ impl App {
 
         // Each mod's files: Workshop from its vaulted version (pack, png,
         // sidecar); local mods from their whole folder.
-        let vault = vault_dir();
+        let vault = versioned_mods_dir();
         let mut packs = 0usize;
         let mut missing = 0usize;
         for e in &entries {
@@ -2175,7 +2173,7 @@ impl App {
     /// its profile under `modlists/`, without overwriting an existing one.
     /// Returns (profile name it was saved as, packs verified).
     fn import_bundle(path: &Path, as_name: Option<&str>) -> Result<(String, usize)> {
-        let vault = vault_dir();
+        let vault = versioned_mods_dir();
         fs::create_dir_all(&vault)?;
         let file =
             fs::File::open(path).with_context(|| format!("could not open {}", path.display()))?;
@@ -2238,7 +2236,7 @@ impl App {
             ) else {
                 continue;
             };
-            let Some(pack) = find_vault_pack(&vault.join(sid).join(manifest)) else {
+            let Some(pack) = find_stored_pack(&vault.join(sid).join(manifest)) else {
                 continue;
             };
             if let Some(actual) = pack_sha256(&pack) {
@@ -2944,7 +2942,7 @@ fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<()> {
                         match App::export_bundle(&name, &dest) {
                             Ok((path, packs, missing)) => {
                                 let miss = if missing > 0 {
-                                    format!(", {missing} without a vaulted pack")
+                                    format!(", {missing} without a stored pack")
                                 } else {
                                     String::new()
                                 };
@@ -3022,8 +3020,8 @@ fn usage() {
            used-mods    Dry run: print the exact ordered load order and the\n               \
            used_mods.txt / used_mods_overlay.txt a launch would pass to the\n               \
            game — no files written, nothing launched\n  \
-           export       Pack a profile + its vaulted packs into one .tar\n  \
-           import       Unpack a bundle into the vault and install its profile\n  \
+           export       Pack a profile + its stored packs into one .tar\n  \
+           import       Unpack a bundle into the store and install its profile\n  \
            -h, --help   Show this help\n\n\
          Keys:\n  \
            tab / h / l      switch pane   j/k or arrows        select\n  \
@@ -3048,24 +3046,27 @@ fn usage() {
            A mod is a folder mirrored into the game's data/. Workshop items\n  \
            (workshop/content/<appid>/<id>/) and local mods each are folders\n  \
            holding one or more .pack files (+ loose assets for local mods).\n  \
-           For a local mod, make a subfolder of ~/Games/TotalWarWH3/mods\n  \
-           (TWWH3_LOCAL) — e.g. mods/MyMod/ — put its .pack(s) at the folder\n  \
-           root and any loose files (movies/, etc.) in matching subdirs;\n  \
+           For a local mod, make a subfolder of the local_mods dir\n  \
+           (TWWH3_LOCAL) — e.g. local_mods/MyMod/ — put its .pack(s) at the\n  \
+           folder root and any loose files (movies/, etc.) in matching\n  \
+           subdirs;\n  \
            it appears under Available marked 'local'. No Steam Workshop\n  \
            needed. The load order lives in profiles; moddata.dat is read for\n  \
            Workshop names but never written (launch is overlay-only).\n\n\
          Versioning (Workshop only):\n  \
            Profiles pin each Workshop mod's Steam manifest (depot GID for an\n  \
            exact version) plus a sha256 and the game build id at save time;\n  \
-           the packs are copied into the vault. When Steam force-updates a\n  \
-           mod, the load order marks it '(updated)' and L loads the pinned\n  \
-           version from the vault. Local mods aren't vaulted (you own them).\n\n\
+           the item is copied into versioned_workshop_mods (keyed by id +\n  \
+           manifest). When Steam force-updates a mod, the load order marks\n  \
+           it '(updated)' and L loads the pinned version from that store.\n  \
+           Local mods aren't versioned (you own them).\n\n\
          Staging & overlay:\n  \
            On launch each mod folder is mirrored into a staging folder of\n  \
-           symlinks (default: ~/Games/TotalWarWH3/staging) — Workshop packs\n  \
-           resolve through the vault (current version, vaulted on demand, or\n  \
-           the pinned one); local folders mirror as-is. `ls -lR` there shows\n  \
-           the resolution. Because Workshop packs resolve through the vault,\n  \
+           symlinks (default: ~/Games/TotalWarWH3/staging) — Workshop files\n  \
+           resolve through versioned_workshop_mods (current version, stored\n  \
+           on demand, or the pinned one); local folders mirror as-is.\n  \
+           `ls -lR` there shows the resolution. Because Workshop files\n  \
+           resolve through that store,\n  \
            a launch never depends on the live workshop folder and an\n  \
            unsubscribed mod still plays.\n  \
            twwh3-run then merges the staging folder into the game's data/\n  \
@@ -3076,18 +3077,20 @@ fn usage() {
            itself; while the TUI is open it services the mount from outside\n  \
            the sandbox (launch with L, or keep twwh3-mods running).\n\n\
          Portable bundles:\n  \
-           `export <profile>` writes <profile>.twwh3bundle.tar containing the\n  \
-           profile and every pinned pack from the vault (in the TUI, press e\n  \
-           in the profiles popup — it lands in <data_dir>/bundles). Move or\n  \
-           share that one file; `import <bundle.tar>` unpacks the packs back\n  \
-           into the vault (verifying each against its sha256) and installs\n  \
+           `export <profile>` writes <profile>.twwh3bundle.tar with the\n  \
+           profile, its versioned Workshop packs, and its local mod folders\n  \
+           (in the TUI, press e in the profiles popup — it lands in\n  \
+           <data_dir>/bundles). Move or share that one file;\n  \
+           `import <bundle.tar>` unpacks it back (verifying each pack against\n  \
+           its sha256) and installs\n  \
            the profile without overwriting an existing one (--as renames).\n\n\
          Configuration (~/.config/twwh3-mods/config, `key = value` lines):\n  \
            steam_root  Steam library containing the game (default: ~/.local/share/Steam)\n  \
            data_dir    Base for this tool's data (default: ~/Games/TotalWarWH3)\n  \
            modlists    Profiles          (default: <data_dir>/modlists)\n  \
-           vault       Pinned versions   (default: <data_dir>/vault)\n  \
-           local_mods  Non-Workshop mods (default: <data_dir>/mods)\n  \
+           versioned_workshop_mods  Cached Workshop mod versions\n                                    \
+           (default: <data_dir>/versioned_workshop_mods)\n  \
+           local_mods  Non-Workshop mod folders (default: <data_dir>/local_mods)\n  \
            staging     Launch symlinks   (default: <data_dir>/staging)\n  \
            moddata     Launcher mod list file    (default: derived from steam_root)\n  \
            workshop    Workshop content dir      (default: derived from steam_root)\n  \
@@ -3096,7 +3099,7 @@ fn usage() {
            overlay     on (default) | off — twwh3-run's data/ overlay\n  \
            open_with   command `o` opens folders with (default: xdg-open)\n\n  \
            Each key also has an env var that overrides it: STEAM_ROOT,\n  \
-           TWWH3_DATA, TWWH3_MODLISTS, TWWH3_VAULT, TWWH3_LOCAL,\n  \
+           TWWH3_DATA, TWWH3_MODLISTS, TWWH3_VERSIONED_WORKSHOP_MODS, TWWH3_LOCAL,\n  \
            TWWH3_STAGING, TWWH3_MODDATA, TWWH3_WORKSHOP, TWWH3_GAME,\n  \
            TWWH3_IMAGES, TWWH3_OVERLAY, TWWH3_OPEN. `twwh3-mods --paths`\n  \
            shows the resolved values."
@@ -3123,7 +3126,7 @@ fn main() -> Result<()> {
                 .unwrap_or_else(|| env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
             let (path, packs, missing) = App::export_bundle(name, &dest)?;
             let miss = if missing > 0 {
-                format!(", {missing} without a vaulted pack")
+                format!(", {missing} without a stored pack")
             } else {
                 String::new()
             };
@@ -3177,7 +3180,7 @@ fn main() -> Result<()> {
             None => println!("game_dir:     (not found)"),
         }
         println!("modlists:     {}", modlists_dir().display());
-        println!("vault:        {}", vault_dir().display());
+        println!("versioned_workshop_mods: {}", versioned_mods_dir().display());
         println!("local_mods:   {}", local_mods_dir().display());
         println!("staging:      {}", staging_dir().display());
         println!(

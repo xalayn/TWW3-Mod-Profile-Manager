@@ -20,7 +20,7 @@ Workshop at all.
   the left, your ordered load order on the right. Multi-pack mods show a
   pack count; local mods are marked `local`.
 - **Mods are folders** — a mod is `workshop/content/<appid>/<id>/` or a
-  `mods/<name>/` folder. Put its `.pack`(s) at the folder root and any
+  `local_mods/<name>/` folder. Put its `.pack`(s) at the folder root and any
   loose files (movies, tables) in matching subdirs; the whole folder is
   mirrored into `data/` at launch. The load order lives in profiles; the
   launcher's `moddata.dat` is read for Workshop names but never written.
@@ -29,19 +29,20 @@ Workshop at all.
   rather than lost.
 - **Version pinning (Workshop)** — saving a profile records each Workshop
   mod's exact version (depot manifest) plus a `sha256`, and copies the
-  packs into a local vault. When Steam force-updates a mod, the TUI flags
-  it `(updated)` and launches your pinned version from the vault instead.
-  Local mods aren't vaulted — you own their files.
-- **Portable setups** — Workshop mods launch from the vault, so a setup
+  item into a local store (`versioned_workshop_mods/<id>/<manifest>/`).
+  When Steam force-updates a mod, the TUI flags it `(updated)` and launches
+  your pinned version from the store instead. Local mods aren't stored —
+  you own their files.
+- **Portable setups** — Workshop mods launch from that store, so a setup
   never depends on the live Workshop folder (an unsubscribed mod still
   plays). `export` a profile to a single `.twwh3bundle.tar` (profile + its
   Workshop packs + local mod folders) to move it to another machine or
   share it; `import` unpacks it back, verifying each pack's `sha256`.
-- **Local mods** — make a subfolder under `~/Games/TotalWarWH3/mods` per
-  mod; it shows up alongside Workshop mods, no copying into the game dir.
+- **Local mods** — make a subfolder under `~/Games/TotalWarWH3/local_mods`
+  per mod; it shows up alongside Workshop mods, no copying into the game dir.
 - **Staging** — at launch each mod folder is mirrored into a staging
   folder of symlinks (`~/Games/TotalWarWH3/staging`): Workshop packs
-  resolve through the vault (current or pinned version), local folders
+  resolve through the versioned-mods store (current or pinned version), local folders
   mirror as-is. `ls -lR` there shows the whole resolution.
 - **Overlay mounting** — `twwh3-run` merges the staging folder into the game's
   `data/` directory with a fuse-overlayfs mount for the duration of the
@@ -126,7 +127,7 @@ twwh3-mods --paths               # show every resolved path
 twwh3-mods used-mods             # dry run: print the exact load order the
                                  #   game will be passed (no writes/launch)
 twwh3-mods export <profile>      # pack a profile + its packs into a .tar
-twwh3-mods import <bundle.tar>   # unpack a bundle into the vault + profiles
+twwh3-mods import <bundle.tar>   # unpack a bundle into the store + profiles
 ```
 
 Keys: `tab`/`h`/`l` switch pane · `j`/`k` select · `space`/`enter`
@@ -143,7 +144,7 @@ first (press `o` again to unmount).
 The status page (`S`) is the first thing to check when something's off:
 it shows every resolved path, whether the Steam launch options and the
 overlay requirements (fuse-overlayfs, fusermount3, /dev/fuse) are in
-place, version-pin drift, and vault usage.
+place, version-pin drift, and versioned-mods store usage.
 
 Settings snapshots (saves, campaign state, options — everything in the
 game's Roaming folder):
@@ -163,5 +164,5 @@ Environment variables override the file; run `twwh3-mods --paths` to see
 what resolves to what.
 
 By default everything lives under `~/Games/TotalWarWH3/` (profiles,
-vault, local mods, staging, snapshots) and Steam is expected at
-`~/.local/share/Steam`.
+versioned_workshop_mods, local mods, staging, snapshots) and Steam is
+expected at `~/.local/share/Steam`.

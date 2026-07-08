@@ -15,13 +15,14 @@
 # Mod-list profiles (twwh3-mods).
 #modlists = ~/Games/TotalWarWH3/modlists
 
-# Vaulted pack versions for update pinning (twwh3-mods).
-#vault = ~/Games/TotalWarWH3/vault
+# Cached exact Steam Workshop mod versions, for update pinning — keyed by
+# workshop id + manifest (twwh3-mods). Only Workshop mods go here.
+#versioned_workshop_mods = ~/Games/TotalWarWH3/versioned_workshop_mods
 
-# Local (non-Workshop) mods: one subfolder per mod (mods/<name>/) holding
-# its .pack file(s) at the folder root plus any loose assets in matching
-# subdirs; the whole folder is mirrored into the game's data/ at launch.
-#local_mods = ~/Games/TotalWarWH3/mods
+# Local (non-Workshop) mods: one subfolder per mod (local_mods/<name>/)
+# holding its .pack file(s) at the folder root plus any loose assets in
+# matching subdirs; the whole folder is mirrored into the game's data/.
+#local_mods = ~/Games/TotalWarWH3/local_mods
 
 # Staging folder: rebuilt on every launch with one symlink per enabled
 # mod, pointing at the exact pack version the game will load.
