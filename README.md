@@ -17,19 +17,27 @@ made in either show up in both.
 - **Two-pane TUI** — every installed mod (Steam Workshop + local) on the
   left, your ordered load order on the right. Fresh Workshop
   subscriptions appear immediately, marked `new`.
-- **Profiles** — named mod lists you can switch between. Mods missing on
-  disk are remembered, flagged, and skipped rather than lost.
+- **Profiles** — named mod lists you can switch between, and rename
+  (`r`). Mods missing on disk are remembered, flagged, and skipped
+  rather than lost.
 - **Version pinning** — saving a profile records each mod's exact Steam
-  Workshop version (depot manifest) and copies the pack into a local
-  vault. When Steam force-updates a mod, the TUI flags it `(updated)`
-  and launches with your pinned version from the vault instead.
+  Workshop version (depot manifest) plus a `sha256` of the pack, and
+  copies the pack into a local vault. When Steam force-updates a mod, the
+  TUI flags it `(updated)` and launches with your pinned version from the
+  vault instead.
+- **Portable setups** — the load order always launches from the vault, so
+  a setup never depends on the live Workshop folder (an unsubscribed mod
+  still plays). `export` a profile to a single `.twwh3bundle.tar` (profile
+  + its packs) to move it to another machine or share it; `import` unpacks
+  it back into the vault, verifying each pack's `sha256`.
 - **Local mods** — drop `.pack` files into `~/Games/TotalWarWH3/mods`
   and they show up alongside Workshop mods. No copying into the game
   directory.
 - **Staging** — at launch, the load order is materialized as a folder
   of symlinks (`~/Games/TotalWarWH3/staging`), one per mod, each
-  pointing at the exact file the game will read. `ls -l` there shows the
-  whole resolution: workshop copy, vaulted pin, or local file.
+  pointing into the vault at the exact version the game will read (the
+  current one, vaulted on demand, or the pinned one). Local mods point at
+  their file. `ls -l` there shows the whole resolution.
 - **Overlay mounting** — `twwh3-run` merges the staging folder into the game's
   `data/` directory with a fuse-overlayfs mount for the duration of the
   run. Mods that only load from `data/` (movie packs) just work, the
@@ -99,15 +107,21 @@ launch.
 ## Usage
 
 ```sh
-twwh3-mods            # the TUI
-twwh3-mods --list     # print load order + available mods
-twwh3-mods --launch   # write used_mods.txt and start the game
-twwh3-mods --paths    # show every resolved path
+twwh3-mods                       # the TUI
+twwh3-mods --list                # print load order + available mods
+twwh3-mods --launch              # write used_mods.txt and start the game
+twwh3-mods --paths               # show every resolved path
+twwh3-mods used-mods             # dry run: print the exact load order the
+                                 #   game will be passed (no writes/launch)
+twwh3-mods export <profile>      # pack a profile + its packs into a .tar
+twwh3-mods import <bundle.tar>   # unpack a bundle into the vault + profiles
 ```
 
 Keys: `tab`/`h`/`l` switch pane · `j`/`k` select · `space`/`enter`
 add/remove · `J`/`K` reorder · `p` profiles · `s` save · `S` status
-page · `o` open the merged `data/` view · `L` launch · `q` quit.
+page · `o` open the merged `data/` view · `L` launch · `?` help · `q`
+quit. Press `?` for the full key list; in the profiles popup, `n` new,
+`r` rename, `e` export, `d` delete.
 
 `o` opens the game's `data/` folder in your file manager *as the game
 will see it*: if the overlay is up (game running) it opens the live

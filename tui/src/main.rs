@@ -31,9 +31,11 @@ use ratatui_image::picker::Picker;
 use ratatui_image::protocol::StatefulProtocol;
 use ratatui_image::StatefulImage;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
+use std::io::Read as _;
 use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -208,13 +210,20 @@ fn parse_workshop_acf(text: &str) -> HashMap<String, WsInfo> {
             "}" => {
                 if depth == cur_depth {
                     if let Some((id, info)) = cur.take() {
-                        // Both ItemsInstalled and ItemDetails carry these
-                        // fields; prefer whichever copy has a manifest.
-                        match map.get(&id) {
-                            Some(old) if !old.manifest.is_empty() && info.manifest.is_empty() => {}
-                            _ => {
-                                map.insert(id, info);
-                            }
+                        // Each item appears twice: WorkshopItemsInstalled
+                        // carries size (+ timeupdated, manifest);
+                        // WorkshopItemDetails carries manifest (+
+                        // timeupdated) but no size. Merge field-by-field so
+                        // the second block can't wipe out the first's size.
+                        let slot = map.entry(id).or_default();
+                        if info.size != 0 {
+                            slot.size = info.size;
+                        }
+                        if info.timeupdated != 0 {
+                            slot.timeupdated = info.timeupdated;
+                        }
+                        if !info.manifest.is_empty() {
+                            slot.manifest = info.manifest;
                         }
                     }
                 }
@@ -492,12 +501,97 @@ fn vault_pack(entry: &ModEntry, manifest: &str) -> Result<bool> {
     let tmp = dst_dir.join(format!(".{}.tmp", fname.to_string_lossy()));
     fs::copy(pack, &tmp).with_context(|| format!("could not vault {}", pack.display()))?;
     fs::rename(&tmp, &dst)?;
+    // Record a content hash beside the pack so a version can be verified
+    // independently of Steam (used when importing a shared bundle).
+    if let Some(hash) = pack_sha256(&dst) {
+        let _ = fs::write(sha256_sidecar(&dst), hash);
+    }
     if let Some(png) = &entry.png {
         if let Some(png_name) = png.file_name() {
             let _ = fs::copy(png, dst_dir.join(png_name));
         }
     }
     Ok(true)
+}
+
+/// Streaming SHA-256 of a file, hex-encoded. `manifest` (Steam's depot
+/// GID) names an exact *version*; this hashes the actual pack bytes.
+fn pack_sha256(path: &Path) -> Option<String> {
+    let mut f = fs::File::open(path).ok()?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 1 << 16];
+    loop {
+        match f.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => hasher.update(&buf[..n]),
+            Err(_) => return None,
+        }
+    }
+    let mut hex = String::with_capacity(64);
+    use std::fmt::Write as _;
+    for b in hasher.finalize() {
+        let _ = write!(hex, "{b:02x}");
+    }
+    Some(hex)
+}
+
+/// The `<pack>.sha256` sidecar path next to a vaulted pack.
+fn sha256_sidecar(pack: &Path) -> PathBuf {
+    let mut name = pack.file_name().unwrap_or_default().to_os_string();
+    name.push(".sha256");
+    pack.with_file_name(name)
+}
+
+/// The `.pack` file inside a vault version directory, if any.
+fn find_vault_pack(dir: &Path) -> Option<PathBuf> {
+    fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("pack")))
+}
+
+/// A profile name in `dir` that doesn't collide, appending " 2", " 3", …
+/// to `base` if needed. Non-destructive: never overwrites an existing
+/// profile.
+fn unique_profile_name(dir: &Path, base: &str) -> String {
+    if !dir.join(format!("{base}.json")).exists() {
+        return base.to_string();
+    }
+    (2..)
+        .map(|n| format!("{base} {n}"))
+        .find(|c| !dir.join(format!("{c}.json")).exists())
+        .unwrap_or_else(|| base.to_string())
+}
+
+/// Append in-memory bytes to a tar under `name`.
+fn tar_append_bytes<W: std::io::Write>(
+    tar: &mut tar::Builder<W>,
+    name: &str,
+    data: &[u8],
+) -> Result<()> {
+    let mut header = tar::Header::new_gnu();
+    header.set_size(data.len() as u64);
+    header.set_mode(0o644);
+    header.set_cksum();
+    tar.append_data(&mut header, name, data)?;
+    Ok(())
+}
+
+/// The content hash of a vaulted pack version, read from its sidecar (or
+/// computed and cached if the sidecar is absent — e.g. an older vault).
+fn vaulted_sha256(entry: &ModEntry, manifest: &str) -> Option<String> {
+    let pack = vaulted_pack(entry, manifest)?;
+    let sidecar = sha256_sidecar(&pack);
+    if let Ok(s) = fs::read_to_string(&sidecar) {
+        let s = s.trim().to_string();
+        if !s.is_empty() {
+            return Some(s);
+        }
+    }
+    let hash = pack_sha256(&pack)?;
+    let _ = fs::write(&sidecar, &hash);
+    Some(hash)
 }
 
 /// Rebuild the staging folder so it contains exactly one link per pack
@@ -699,6 +793,7 @@ enum Mode {
     Profiles,
     NameInput,
     Status,
+    Help,
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -724,6 +819,42 @@ struct PreviewLine {
 struct MlEntry {
     uuid: String,
     steam_id: Option<String>,
+    manifest: Option<String>,
+    sha256: Option<String>,
+}
+
+/// Where a resolved pack loads from at launch.
+#[derive(PartialEq, Clone, Copy)]
+enum PackSource {
+    /// Current version, served from the vault (vaulted on demand).
+    Vault,
+    /// Pinned version from the vault (Steam has updated past the pin).
+    Pinned,
+    /// A local (non-Workshop) pack, loaded from its file.
+    Local,
+    /// Steam mod with no known manifest — loaded live from the workshop.
+    Workshop,
+}
+
+impl PackSource {
+    fn label(self) -> &'static str {
+        match self {
+            PackSource::Vault => "vault",
+            PackSource::Pinned => "vault (pinned)",
+            PackSource::Local => "local",
+            PackSource::Workshop => "workshop (not vaulted)",
+        }
+    }
+}
+
+/// One entry of the resolved load order: the exact pack the game will
+/// load, in order. `fname` is the `mod "…";` token written to used_mods.
+struct ResolvedPack {
+    name: String,
+    fname: String,
+    path: PathBuf,
+    source: PackSource,
+    pool_idx: usize,
     manifest: Option<String>,
 }
 
@@ -758,6 +889,8 @@ struct App {
     preview: Vec<PreviewLine>,
     confirm_delete: bool,
     input: String,
+    /// When set, the name input renames this profile instead of creating.
+    rename_from: Option<String>,
     /// Rows of the status page, computed when it is opened (S).
     status_lines: Vec<StatusLine>,
     /// We mounted a data/ overlay preview (o) and must unmount it.
@@ -831,6 +964,7 @@ impl App {
             preview: Vec::new(),
             confirm_delete: false,
             input: String::new(),
+            rename_from: None,
             status_lines: Vec::new(),
             preview_mounted: false,
         };
@@ -1300,6 +1434,10 @@ impl App {
                         .get("manifest")
                         .and_then(Value::as_str)
                         .map(String::from),
+                    sha256: e
+                        .get("sha256")
+                        .and_then(Value::as_str)
+                        .map(String::from),
                 })
             })
             .collect())
@@ -1362,6 +1500,9 @@ impl App {
                         o["size"] = Value::from(w.size);
                         if vault_pack(entry, &w.manifest)? {
                             vaulted += 1;
+                        }
+                        if let Some(hash) = vaulted_sha256(entry, &w.manifest) {
+                            o["sha256"] = Value::from(hash);
                         }
                     }
                 }
@@ -1451,45 +1592,103 @@ impl App {
 
     // -- launching ----------------------------------------------------------
 
-    /// Generate used_mods.txt in the game dir from the load order. Each
-    /// mod is resolved to the exact pack file it should load — the
-    /// vaulted (pinned) version when Steam has updated past the
-    /// profile's pin, the live copy otherwise — and materialized as a
-    /// symlink in the staging folder, which twwh3-run overlays onto the
-    /// game's data/ (or, without fuse-overlayfs, becomes the game's mod
-    /// working directory). `ls -l` on staging shows the full resolution.
-    /// Returns (mods, pinned).
-    fn write_used_mods(&self) -> Result<(usize, usize)> {
-        let game_dir = game_install_dir().context(
-            "could not find the game install dir (steamapps/common/Total War WARHAMMER III)",
-        )?;
-        let mut packs: Vec<PathBuf> = Vec::new();
-        let mut mod_lines: Vec<String> = Vec::new();
-        let mut pinned = 0usize;
+    /// The load order resolved to concrete packs, in launch order, deduped
+    /// by file name, with missing/unresolvable mods skipped. This is the
+    /// single source of truth for both launch (`write_used_mods`) and the
+    /// dry-run preview (`used_mods_preview`), so the two can never drift.
+    /// Read-only: for a not-yet-vaulted current version it returns the
+    /// vault path it *will* load from; the caller materializes it.
+    fn resolve_load_order(&self) -> Vec<ResolvedPack> {
+        let mut out: Vec<ResolvedPack> = Vec::new();
         for s in &self.slots {
-            let Some(entry) = s.idx.map(|i| &self.pool[i]) else { continue };
+            let Some(idx) = s.idx else { continue };
+            let entry = &self.pool[idx];
             if entry.missing {
                 continue;
             }
             let Some(live) = &entry.pack_path else { continue };
-            let path = if self.slot_updated(s) {
+            let Some(fname) = live.file_name().and_then(|f| f.to_str()).map(String::from) else {
+                continue;
+            };
+            // When Steam has moved past the profile's pin and we have the
+            // pinned version vaulted, load that; otherwise the current
+            // version (from the vault; local mods from their file).
+            let (path, source, manifest) = if self.slot_updated(s) {
                 match self.pins.get(&s.uuid).and_then(|m| vaulted_pack(entry, m)) {
-                    Some(vaulted) => {
-                        pinned += 1;
-                        vaulted
-                    }
-                    None => live.clone(),
+                    Some(v) => (v, PackSource::Pinned, self.pins.get(&s.uuid).cloned()),
+                    None => self.resolve_current(entry, live),
                 }
             } else {
-                live.clone()
+                self.resolve_current(entry, live)
             };
-            let Some(fname) = path.file_name().and_then(|f| f.to_str()) else { continue };
-            if packs.iter().any(|p| p.file_name() == path.file_name()) {
+            if out.iter().any(|r| r.fname == fname) {
                 continue;
             }
-            mod_lines.push(format!("mod \"{fname}\";"));
-            packs.push(path);
+            out.push(ResolvedPack {
+                name: entry.name().to_string(),
+                fname,
+                path,
+                source,
+                pool_idx: idx,
+                manifest,
+            });
         }
+        out
+    }
+
+    /// Where the *current* installed version of `entry` loads from at
+    /// launch: the vault (steam mods, vaulted on demand) or the file
+    /// itself (local mods, or steam mods with no known manifest).
+    fn resolve_current(&self, entry: &ModEntry, live: &Path) -> (PathBuf, PackSource, Option<String>) {
+        let Some(sid) = &entry.steam_id else {
+            return (live.to_path_buf(), PackSource::Local, None);
+        };
+        if entry.local {
+            return (live.to_path_buf(), PackSource::Local, None);
+        }
+        match self.ws.get(sid).map(|w| w.manifest.clone()).filter(|m| !m.is_empty()) {
+            Some(manifest) => {
+                let path = live
+                    .file_name()
+                    .map(|f| vault_dir().join(sid).join(&manifest).join(f))
+                    .unwrap_or_else(|| live.to_path_buf());
+                (path, PackSource::Vault, Some(manifest))
+            }
+            None => (live.to_path_buf(), PackSource::Workshop, None),
+        }
+    }
+
+    /// Generate used_mods.txt in the game dir from the load order, using
+    /// the shared resolver. Each mod is materialized as a symlink in the
+    /// staging folder pointing into the vault (pinned or current version,
+    /// vaulted on demand), which twwh3-run overlays onto the game's data/
+    /// (or, without fuse-overlayfs, becomes the mod working directory).
+    /// Because staging points into the vault, a launch never depends on
+    /// the Steam workshop folder. `ls -l` on staging shows the full
+    /// resolution. Returns (mods, pinned).
+    fn write_used_mods(&self) -> Result<(usize, usize)> {
+        let game_dir = game_install_dir().context(
+            "could not find the game install dir (steamapps/common/Total War WARHAMMER III)",
+        )?;
+        let resolved = self.resolve_load_order();
+        // Vault current versions on demand so their symlinks resolve; the
+        // pinned ones are already vaulted (that's how they were resolved).
+        let mut packs: Vec<PathBuf> = Vec::with_capacity(resolved.len());
+        for r in &resolved {
+            if r.source == PackSource::Vault {
+                if let Some(m) = &r.manifest {
+                    let _ = vault_pack(&self.pool[r.pool_idx], m);
+                }
+            }
+            // Fall back to the live pack if a vault write didn't land, so
+            // staging never holds a dangling link.
+            if r.path.exists() {
+                packs.push(r.path.clone());
+            } else {
+                packs.push(self.pool[r.pool_idx].pack_path.clone().unwrap_or_else(|| r.path.clone()));
+            }
+        }
+        let pinned = resolved.iter().filter(|r| r.source == PackSource::Pinned).count();
         let staging = staging_dir();
         rebuild_staging(&staging, &packs)?;
         // Two lists: used_mods.txt loads packs from the staging folder
@@ -1500,18 +1699,55 @@ impl App {
         // one depending on whether the mount succeeded.
         let mut out = format!("add_working_directory \"{}\";\n", unix_to_win(&staging));
         let mut overlay_out = String::new();
-        for l in &mod_lines {
-            out.push_str(l);
-            out.push('\n');
-            overlay_out.push_str(l);
-            overlay_out.push('\n');
+        for r in &resolved {
+            out.push_str(&format!("mod \"{}\";\n", r.fname));
+            overlay_out.push_str(&format!("mod \"{}\";\n", r.fname));
         }
         fs::write(game_dir.join("used_mods.txt"), out)
             .with_context(|| format!("could not write used_mods.txt in {}", game_dir.display()))?;
         fs::write(game_dir.join("used_mods_overlay.txt"), overlay_out).with_context(|| {
             format!("could not write used_mods_overlay.txt in {}", game_dir.display())
         })?;
-        Ok((mod_lines.len(), pinned))
+        Ok((resolved.len(), pinned))
+    }
+
+    /// Render exactly what a launch would pass to the game, without
+    /// writing anything or touching the vault — the ordered load order,
+    /// each mod's resolved source, and the literal contents of both
+    /// used_mods files. Shares `resolve_load_order` with the real launch,
+    /// so the mod lines and their order are byte-identical to a launch.
+    fn used_mods_preview(&self) -> String {
+        let resolved = self.resolve_load_order();
+        let staging = staging_dir();
+        let overlay = setting("TWWH3_OVERLAY", "overlay").unwrap_or_else(|| "on".into());
+        let mut s = String::new();
+        s.push_str(&format!("Load order — {} packs, in launch order:\n", resolved.len()));
+        for (n, r) in resolved.iter().enumerate() {
+            s.push_str(&format!("{:>3}  {}  [{}]\n", n + 1, r.name, r.source.label()));
+        }
+        let missing = self.slots.iter().filter(|s| self.slot_missing(s)).count();
+        if missing > 0 {
+            s.push_str(&format!("     ({missing} missing / not installed — skipped)\n"));
+        }
+        s.push('\n');
+        if overlay == "off" {
+            s.push_str("overlay: off → the game is passed used_mods.txt (working-directory loading)\n\n");
+        } else {
+            s.push_str(
+                "overlay: on → the game is passed used_mods_overlay.txt when the fuse mount \
+                 succeeds,\n             otherwise it falls back to used_mods.txt\n\n",
+            );
+        }
+        s.push_str("----- used_mods_overlay.txt (packs merged into data/) -----\n");
+        for r in &resolved {
+            s.push_str(&format!("mod \"{}\";\n", r.fname));
+        }
+        s.push_str("\n----- used_mods.txt (fallback / overlay off) -----\n");
+        s.push_str(&format!("add_working_directory \"{}\";\n", unix_to_win(&staging)));
+        for r in &resolved {
+            s.push_str(&format!("mod \"{}\";\n", r.fname));
+        }
+        s
     }
 
     /// Write used_mods.txt and ask Steam to start the game (Steam does
@@ -1544,8 +1780,18 @@ impl App {
                 } else {
                     String::new()
                 };
+                // Both mod-list files are written; twwh3-run decides at
+                // launch which the game reads (used_mods_overlay.txt if it
+                // mounts the overlay). twwh3-mods can't know that here, so
+                // don't claim a specific file — point at the log instead.
+                let overlay = setting("TWWH3_OVERLAY", "overlay").unwrap_or_else(|| "on".into());
+                let how = if overlay == "off" {
+                    "used_mods.txt (overlay off — working-directory loading)"
+                } else {
+                    "used_mods_overlay.txt if twwh3-run mounts the overlay, else used_mods.txt"
+                };
                 self.status = format!(
-                    "Launching via Steam: {mods} mods in used_mods.txt{pin_note} (see --help for the one-time launch options setup)"
+                    "Launching via Steam: {mods} mods{pin_note} — game reads {how} (see ~/.cache/twwh3-run.log)"
                 );
             }
             Err(e) => self.status = format!("could not run steam: {e}"),
@@ -1644,6 +1890,185 @@ impl App {
         self.status = format!("Deleted profile '{name}'");
         Ok(())
     }
+
+    fn rename_profile(&mut self, from: &str, to: &str) -> Result<()> {
+        if to == from {
+            return Ok(());
+        }
+        let dir = modlists_dir();
+        let dst = dir.join(format!("{to}.json"));
+        if dst.exists() {
+            bail!("a profile named '{to}' already exists");
+        }
+        fs::rename(dir.join(format!("{from}.json")), &dst)
+            .with_context(|| format!("could not rename '{from}' to '{to}'"))?;
+        if self.current_profile.as_deref() == Some(from) {
+            self.set_current(Some(to.to_string()));
+        }
+        self.status = format!("Renamed profile '{from}' → '{to}'");
+        Ok(())
+    }
+
+    // -- portable bundles ---------------------------------------------------
+
+    /// Pack profile `name` and all of its vaulted packs into a single
+    /// self-contained `<name>.twwh3bundle.tar` under `dest_dir`, so a mod
+    /// setup can be moved to another machine or shared. Returns
+    /// (archive path, packs included, mods without a vaulted pack).
+    fn export_bundle(name: &str, dest_dir: &Path) -> Result<(PathBuf, usize, usize)> {
+        let entries = Self::read_modlist(name)?;
+        let profile_path = modlists_dir().join(format!("{name}.json"));
+        if !profile_path.exists() {
+            bail!("no such profile: {name}");
+        }
+        fs::create_dir_all(dest_dir)
+            .with_context(|| format!("could not create {}", dest_dir.display()))?;
+        let out = dest_dir.join(format!("{name}.twwh3bundle.tar"));
+        let tmp = dest_dir.join(format!(".{name}.twwh3bundle.tar.tmp"));
+        let mut tar = tar::Builder::new(fs::File::create(&tmp)?);
+
+        // Header: schema marker + the pinned version of every mod.
+        let header = serde_json::json!({
+            "schema": 1,
+            "profile": name,
+            "mods": entries.iter().map(|e| serde_json::json!({
+                "uuid": e.uuid,
+                "steam_id": e.steam_id,
+                "manifest": e.manifest,
+                "sha256": e.sha256,
+            })).collect::<Vec<_>>(),
+        });
+        tar_append_bytes(&mut tar, "bundle.json", &serde_json::to_vec_pretty(&header)?)?;
+        // The profile file itself, applied verbatim on import.
+        tar.append_path_with_name(&profile_path, "profile.json")?;
+
+        // Every file of each mod's pinned vault version (pack, png, sidecar).
+        let vault = vault_dir();
+        let mut packs = 0usize;
+        let mut missing = 0usize;
+        for e in &entries {
+            let (Some(sid), Some(manifest)) = (&e.steam_id, &e.manifest) else {
+                missing += 1;
+                continue;
+            };
+            let dir = vault.join(sid).join(manifest);
+            let mut has_pack = false;
+            for f in fs::read_dir(&dir).into_iter().flatten().flatten() {
+                let p = f.path();
+                if !p.is_file() {
+                    continue;
+                }
+                let Some(fname) = p.file_name().and_then(|s| s.to_str()) else { continue };
+                tar.append_path_with_name(&p, format!("packs/{sid}/{manifest}/{fname}"))?;
+                if p.extension().is_some_and(|x| x.eq_ignore_ascii_case("pack")) {
+                    has_pack = true;
+                }
+            }
+            if has_pack {
+                packs += 1;
+            } else {
+                missing += 1;
+            }
+        }
+        tar.finish()?;
+        drop(tar);
+        fs::rename(&tmp, &out)?;
+        Ok((out, packs, missing))
+    }
+
+    /// Import a bundle produced by `export_bundle`: extract its packs into
+    /// the vault (verifying each against the recorded sha256) and install
+    /// its profile under `modlists/`, without overwriting an existing one.
+    /// Returns (profile name it was saved as, packs verified).
+    fn import_bundle(path: &Path, as_name: Option<&str>) -> Result<(String, usize)> {
+        let vault = vault_dir();
+        fs::create_dir_all(&vault)?;
+        let file =
+            fs::File::open(path).with_context(|| format!("could not open {}", path.display()))?;
+        let mut ar = tar::Archive::new(file);
+        let mut profile_json: Option<Vec<u8>> = None;
+        let mut header: Option<Value> = None;
+        for entry in ar.entries()? {
+            let mut entry = entry?;
+            let arc = entry.path()?.into_owned();
+            let name = arc.to_string_lossy().to_string();
+            if name == "bundle.json" {
+                let mut buf = Vec::new();
+                entry.read_to_end(&mut buf)?;
+                header = serde_json::from_slice(&buf).ok();
+            } else if name == "profile.json" {
+                let mut buf = Vec::new();
+                entry.read_to_end(&mut buf)?;
+                profile_json = Some(buf);
+            } else if let Ok(rel) = arc.strip_prefix("packs") {
+                // packs/<sid>/<manifest>/<file> -> vault/<sid>/<manifest>/<file>
+                if rel.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+                    bail!("bundle contains an unsafe path: {name}");
+                }
+                // Bare directory entries (e.g. "packs/") carry no file.
+                if rel.as_os_str().is_empty() || entry.header().entry_type().is_dir() {
+                    continue;
+                }
+                let dst = vault.join(rel);
+                if let Some(parent) = dst.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                entry.unpack(&dst)?;
+            }
+        }
+        let Some(profile_json) = profile_json else {
+            bail!("not a twwh3 bundle (no profile.json)");
+        };
+
+        // Verify each extracted pack against the profile's recorded hash.
+        let root: Value = serde_json::from_slice(&profile_json)?;
+        let mut verified = 0usize;
+        for m in root.get("mods").and_then(Value::as_array).into_iter().flatten() {
+            let (Some(sid), Some(manifest), Some(sha)) = (
+                m.get("steam_id").and_then(Value::as_str),
+                m.get("manifest").and_then(Value::as_str),
+                m.get("sha256").and_then(Value::as_str),
+            ) else {
+                continue;
+            };
+            let Some(pack) = find_vault_pack(&vault.join(sid).join(manifest)) else {
+                continue;
+            };
+            if let Some(actual) = pack_sha256(&pack) {
+                if actual != sha {
+                    bail!(
+                        "checksum mismatch for {} — bundle may be corrupt",
+                        pack.file_name().unwrap_or_default().to_string_lossy()
+                    );
+                }
+                verified += 1;
+            }
+        }
+
+        // Pick a non-colliding profile name and install the profile file.
+        let base = as_name
+            .map(str::to_string)
+            .or_else(|| {
+                header
+                    .as_ref()
+                    .and_then(|h| h.get("profile").and_then(Value::as_str))
+                    .map(String::from)
+            })
+            .or_else(|| {
+                path.file_name()
+                    .and_then(|s| s.to_str())
+                    .map(|s| s.trim_end_matches(".tar").trim_end_matches(".twwh3bundle").to_string())
+            })
+            .unwrap_or_else(|| "imported".into());
+        if !valid_profile_name(&base) {
+            bail!("invalid profile name derived from bundle: '{base}' (use --as <name>)");
+        }
+        let dir = modlists_dir();
+        fs::create_dir_all(&dir)?;
+        let name = unique_profile_name(&dir, base.trim());
+        fs::write(dir.join(format!("{name}.json")), &profile_json)?;
+        Ok((name, verified))
+    }
 }
 
 fn valid_profile_name(name: &str) -> bool {
@@ -1728,13 +2153,12 @@ fn draw(f: &mut Frame, app: &mut App) {
     let help_line = if !app.status.is_empty() {
         Line::from(format!(" {}", app.status)).style(Style::default().fg(Color::Yellow))
     } else {
+        // Full controls live in the ? modal; the bar just points to it.
         let keys = match app.mode {
-            Mode::Browse => {
-                " tab pane · j/k select · space add/remove · J/K reorder · p profiles · s save · S status · o data · L launch · q quit"
-            }
-            Mode::Profiles => " enter apply · n new · d delete · esc close",
-            Mode::NameInput => " enter save · esc cancel",
-            Mode::Status => " esc close",
+            Mode::Browse => " ? help · q quit",
+            Mode::Profiles => " enter apply · r rename · n new · e export · d delete · esc close",
+            Mode::NameInput => " enter confirm · esc cancel",
+            Mode::Status | Mode::Help => " esc close",
         };
         Line::from(keys).style(Style::default().fg(Color::DarkGray))
     };
@@ -1744,8 +2168,66 @@ fn draw(f: &mut Frame, app: &mut App) {
         Mode::Profiles => draw_profiles_popup(f, app),
         Mode::NameInput => draw_name_input(f, app),
         Mode::Status => draw_status_popup(f, app),
+        Mode::Help => draw_help_popup(f),
         Mode::Browse => {}
     }
+}
+
+/// All keybindings, grouped, shown by `?`.
+fn draw_help_popup(f: &mut Frame) {
+    // (key, description); empty key = section header, empty both = spacer.
+    let rows: &[(&str, &str)] = &[
+        ("Navigation", ""),
+        ("tab / h / l", "switch pane"),
+        ("j / k / ↑ / ↓", "move selection"),
+        ("g / G", "jump to top / bottom"),
+        ("", ""),
+        ("Load order", ""),
+        ("space / enter", "add to / remove from the load order"),
+        ("J / K", "reorder the selected mod"),
+        ("", ""),
+        ("Profiles (p)", ""),
+        ("enter", "apply the selected profile"),
+        ("n", "new profile from the current load order"),
+        ("r", "rename the selected profile"),
+        ("e", "export the profile as a portable bundle"),
+        ("d", "delete (press twice to confirm)"),
+        ("", ""),
+        ("Actions", ""),
+        ("s", "save load order + profile"),
+        ("S", "status page (paths, launch plumbing)"),
+        ("o", "open game data/ as the game sees it (merged preview)"),
+        ("L", "write used_mods.txt and launch via Steam"),
+        ("? ", "this help"),
+        ("q / esc", "quit (or close a popup)"),
+    ];
+    let full = f.area();
+    let h = (rows.len() as u16 + 2).min(full.height.saturating_sub(2));
+    let area = centered_rect(full.width.saturating_sub(6).min(72), h, full);
+    f.render_widget(Clear, area);
+    let table_rows: Vec<Row> = rows
+        .iter()
+        .map(|(key, desc)| {
+            if desc.is_empty() {
+                Row::new(vec![Cell::from(*key).style(
+                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                )])
+            } else {
+                Row::new(vec![
+                    Cell::from(format!("  {key}"))
+                        .style(Style::default().fg(Color::Yellow)),
+                    Cell::from(*desc),
+                ])
+            }
+        })
+        .collect();
+    let table = Table::new(table_rows, [Constraint::Length(16), Constraint::Min(20)]).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" Keys ")
+            .title_bottom(" esc close "),
+    );
+    f.render_widget(table, area);
 }
 
 fn draw_status_popup(f: &mut Frame, app: &App) {
@@ -2074,7 +2556,7 @@ fn draw_profiles_popup(f: &mut Frame, app: &mut App) {
             Block::default()
                 .borders(Borders::ALL)
                 .title(" Profiles ")
-                .title_bottom(" n new · d delete "),
+                .title_bottom(" n new · r rename · e export · d delete "),
         )
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
         .highlight_symbol("▶ ");
@@ -2118,11 +2600,13 @@ fn draw_profiles_popup(f: &mut Frame, app: &mut App) {
 fn draw_name_input(f: &mut Frame, app: &mut App) {
     let area = centered_rect(44, 3, f.area());
     f.render_widget(Clear, area);
+    let title = match &app.rename_from {
+        Some(from) => format!(" Rename '{from}' to "),
+        None => " New profile name ".to_string(),
+    };
     f.render_widget(
         Paragraph::new(format!("{}▏", app.input)).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" New profile name "),
+            Block::default().borders(Borders::ALL).title(title),
         ),
         area,
     );
@@ -2190,8 +2674,12 @@ fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<()> {
                     }
                     KeyCode::Char('o') => app.toggle_data_view(),
                     KeyCode::Char('L') => app.launch(),
+                    KeyCode::Char('?') => app.mode = Mode::Help,
                     _ => {}
                 }
+            }
+            Mode::Help => {
+                app.mode = Mode::Browse;
             }
             Mode::Status => match key.code {
                 KeyCode::Char('q') | KeyCode::Esc | KeyCode::Char('S') | KeyCode::Enter
@@ -2225,7 +2713,34 @@ fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<()> {
                 }
                 KeyCode::Char('n') => {
                     app.input.clear();
+                    app.rename_from = None;
                     app.mode = Mode::NameInput;
+                }
+                KeyCode::Char('r') => {
+                    if let Some(name) = app.selected_profile().map(String::from) {
+                        app.rename_from = Some(name.clone());
+                        app.input = name;
+                        app.mode = Mode::NameInput;
+                    }
+                }
+                KeyCode::Char('e') => {
+                    if let Some(name) = app.selected_profile().map(String::from) {
+                        let dest = data_dir().join("bundles");
+                        match App::export_bundle(&name, &dest) {
+                            Ok((path, packs, missing)) => {
+                                let miss = if missing > 0 {
+                                    format!(", {missing} without a vaulted pack")
+                                } else {
+                                    String::new()
+                                };
+                                app.status = format!(
+                                    "Exported '{name}' → {} ({packs} packs{miss})",
+                                    tilde(&path)
+                                );
+                            }
+                            Err(e) => app.status = format!("Export failed: {e:#}"),
+                        }
+                    }
                 }
                 KeyCode::Char('d') => {
                     if let Some(name) = app.selected_profile().map(String::from) {
@@ -2243,15 +2758,22 @@ fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<()> {
                 _ => {}
             },
             Mode::NameInput => match key.code {
-                KeyCode::Esc => app.mode = Mode::Profiles,
+                KeyCode::Esc => {
+                    app.rename_from = None;
+                    app.mode = Mode::Profiles;
+                }
                 KeyCode::Enter => {
                     let name = app.input.trim().to_string();
                     if !valid_profile_name(&name) {
                         app.status =
                             "Profile names: letters, digits, space, - _ . only".into();
                     } else {
-                        if let Err(e) = app.save_profile(&name) {
-                            app.status = format!("Could not save profile: {e:#}");
+                        let result = match app.rename_from.take() {
+                            Some(from) => app.rename_profile(&from, &name),
+                            None => app.save_profile(&name),
+                        };
+                        if let Err(e) = result {
+                            app.status = format!("Could not update profile: {e:#}");
                         }
                         app.refresh_profiles();
                         if let Some(i) = app.profiles.iter().position(|p| *p == name) {
@@ -2275,20 +2797,28 @@ fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<()> {
 fn usage() {
     println!(
         "twwh3-mods — TUI mod load-order manager for Total War: WARHAMMER III\n\n\
-         Usage: twwh3-mods [--list | --launch | --paths]\n\n\
+         Usage: twwh3-mods [--list | --launch | --paths | used-mods]\n         \
+                twwh3-mods export <profile> [dest-dir]\n         \
+                twwh3-mods import <bundle.tar> [--as name]\n\n\
          Options:\n  \
            -l, --list   Print the load order and available mods, then exit\n  \
            --launch     Write used_mods.txt and start the game via Steam\n  \
            --paths      Print every resolved path and where config is read from\n  \
+           used-mods    Dry run: print the exact ordered load order and the\n               \
+           used_mods.txt / used_mods_overlay.txt a launch would pass to the\n               \
+           game — no files written, nothing launched\n  \
+           export       Pack a profile + its vaulted packs into one .tar\n  \
+           import       Unpack a bundle into the vault and install its profile\n  \
            -h, --help   Show this help\n\n\
          Keys:\n  \
            tab / h / l      switch pane   j/k or arrows        select\n  \
            space / enter    add to or remove from the load order\n  \
            J/K              reorder within the load order\n  \
-           p                profiles (enter apply, n new, d delete)\n  \
+           p                profiles (enter apply, n new, r rename,\n                    \
+           e export, d delete)\n  \
            o                open the game's data/ folder as the game will\n                    \
            see it (mounts a merged preview; o again unmounts)\n  \
-           s save     S status page     L launch     q quit\n\n\
+           ? help     s save     S status page     L launch     q quit\n\n\
          Launching (one-time setup):\n  \
            L / --launch write used_mods.txt into the game folder and run\n  \
            `steam -applaunch {APPID}` — Steam still does all the Proton work.\n  \
@@ -2304,19 +2834,30 @@ fn usage() {
            they appear under Available, marked 'local'. They load from that\n  \
            folder directly — no need to copy them into the game's data dir.\n\n\
          Versioning:\n  \
-           Profiles pin each mod's Steam manifest (= exact version) and the\n  \
-           game build id at save time; the packs themselves are copied into\n  \
-           the vault. When Steam force-updates a mod, the load order marks\n  \
-           it '(updated)' and L loads the pinned version from the vault.\n\n\
+           Profiles pin each mod's Steam manifest (Steam's depot GID for an\n  \
+           exact version) plus a sha256 of the pack, and the game build id,\n  \
+           at save time; the packs themselves are copied into the vault.\n  \
+           When Steam force-updates a mod, the load order marks it\n  \
+           '(updated)' and L loads the pinned version from the vault.\n\n\
          Staging & overlay:\n  \
            On launch the load order is materialized as a folder of symlinks\n  \
            (default: ~/Games/TotalWarWH3/staging), one per mod, each\n  \
-           pointing at the exact pack the game will read — workshop copy,\n  \
-           vaulted pin, or local file. `ls -l` there shows the resolution.\n  \
+           pointing into the vault — the current version (vaulted on demand)\n  \
+           or the pinned one where Steam has moved on. Local mods load from\n  \
+           their file. `ls -l` there shows the resolution. Because staging\n  \
+           resolves into the vault, a launch never depends on the Steam\n  \
+           workshop folder, and an unsubscribed mod still plays.\n  \
            twwh3-run then merges the staging folder into the game's data/\n  \
            with fuse-overlayfs for the duration of the run (movie packs\n  \
            work; game files stay pristine). Without fuse-overlayfs it\n  \
            falls back to plain working-directory loading automatically.\n\n\
+         Portable bundles:\n  \
+           `export <profile>` writes <profile>.twwh3bundle.tar containing the\n  \
+           profile and every pinned pack from the vault (in the TUI, press e\n  \
+           in the profiles popup — it lands in <data_dir>/bundles). Move or\n  \
+           share that one file; `import <bundle.tar>` unpacks the packs back\n  \
+           into the vault (verifying each against its sha256) and installs\n  \
+           the profile without overwriting an existing one (--as renames).\n\n\
          Configuration (~/.config/twwh3-mods/config, `key = value` lines):\n  \
            steam_root  Steam library containing the game (default: ~/.local/share/Steam)\n  \
            data_dir    Base for this tool's data (default: ~/Games/TotalWarWH3)\n  \
@@ -2344,6 +2885,53 @@ fn main() -> Result<()> {
         usage();
         return Ok(());
     }
+
+    // Bundle subcommands take positional args, so handle them before the
+    // generic flag check below.
+    match args.first().map(String::as_str) {
+        Some("export") => {
+            let name = args
+                .get(1)
+                .context("usage: twwh3-mods export <profile> [dest-dir]")?;
+            let dest = args
+                .get(2)
+                .map(|s| expand_path(s))
+                .unwrap_or_else(|| env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+            let (path, packs, missing) = App::export_bundle(name, &dest)?;
+            let miss = if missing > 0 {
+                format!(", {missing} without a vaulted pack")
+            } else {
+                String::new()
+            };
+            println!("Exported '{name}' → {} ({packs} packs{miss})", path.display());
+            return Ok(());
+        }
+        Some("import") => {
+            let file = args
+                .get(1)
+                .context("usage: twwh3-mods import <bundle.tar> [--as name]")?;
+            let as_name = args
+                .iter()
+                .position(|a| a == "--as")
+                .and_then(|i| args.get(i + 1))
+                .map(String::as_str);
+            let (name, verified) = App::import_bundle(&expand_path(file), as_name)?;
+            println!(
+                "Imported profile '{name}' ({verified} packs verified). \
+                 Run twwh3-mods and press p to apply it."
+            );
+            return Ok(());
+        }
+        Some("used-mods") => {
+            // Dry run: print the exact load order + used_mods contents a
+            // launch would pass, without writing anything.
+            let app = App::load(moddata_path(), None)?;
+            print!("{}", app.used_mods_preview());
+            return Ok(());
+        }
+        _ => {}
+    }
+
     if let Some(bad) = args
         .iter()
         .find(|a| !matches!(a.as_str(), "-l" | "--list" | "--launch" | "--paths"))
