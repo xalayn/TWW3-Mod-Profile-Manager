@@ -530,10 +530,12 @@ fn discover_mods(meta: &HashMap<String, ModMeta>) -> Vec<ModEntry> {
 }
 
 /// Copy a Workshop mod's whole folder (packs, preview, any loose files)
-/// into vault/<sid>/<manifest>/, skipping files already present, so the
-/// vaulted version is a faithful copy that survives unsubscribe. Records
-/// a sha256 sidecar per pack. Returns how many packs were newly vaulted.
-fn store_mod_version(sid: &str, manifest: &str, dir: &Path) -> Result<usize> {
+/// into versioned_workshop_mods/<sid>/<manifest>/, skipping files already
+/// present, so the stored version is a faithful copy that survives
+/// unsubscribe. Records a sha256 sidecar per pack and a `.meta.json` with
+/// the version's update time/size. Returns how many packs were newly
+/// stored.
+fn store_mod_version(sid: &str, manifest: &str, dir: &Path, timeupdated: u64, size: u64) -> Result<usize> {
     if manifest.is_empty() {
         return Ok(0);
     }
@@ -550,9 +552,9 @@ fn store_mod_version(sid: &str, manifest: &str, dir: &Path) -> Result<usize> {
         }
         let fname = rel.file_name().and_then(|s| s.to_str()).unwrap_or("f");
         // Copy to a temp name first so an interrupted copy can't be
-        // mistaken for a complete vaulted file.
+        // mistaken for a complete stored file.
         let tmp = dst.with_file_name(format!(".{fname}.tmp"));
-        fs::copy(&src, &tmp).with_context(|| format!("could not vault {}", src.display()))?;
+        fs::copy(&src, &tmp).with_context(|| format!("could not store {}", src.display()))?;
         fs::rename(&tmp, &dst)?;
         if src.extension().is_some_and(|e| e.eq_ignore_ascii_case("pack")) {
             // A content hash beside the pack lets a version be verified
@@ -563,7 +565,69 @@ fn store_mod_version(sid: &str, manifest: &str, dir: &Path) -> Result<usize> {
             n += 1;
         }
     }
+    write_version_meta(sid, manifest, timeupdated, size);
     Ok(n)
+}
+
+/// Per-version metadata stored alongside the files (never mirrored into
+/// data/, since the mirror's file list comes from the live mod folder).
+fn version_meta_path(sid: &str, manifest: &str) -> PathBuf {
+    versioned_mods_dir().join(sid).join(manifest).join(".meta.json")
+}
+
+/// Record a stored version's Steam update time and size. Won't clobber an
+/// existing record with unknown (0) values.
+fn write_version_meta(sid: &str, manifest: &str, timeupdated: u64, size: u64) {
+    let dir = versioned_mods_dir().join(sid).join(manifest);
+    if !dir.is_dir() {
+        return;
+    }
+    let path = version_meta_path(sid, manifest);
+    if timeupdated == 0 && path.exists() {
+        return;
+    }
+    let meta = serde_json::json!({
+        "manifest": manifest,
+        "timeupdated": timeupdated,
+        "size": size,
+        "stored_at": SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0),
+    });
+    let _ = fs::write(path, serde_json::to_string_pretty(&meta).unwrap_or_default());
+}
+
+/// (timeupdated, size) recorded for a stored version, 0 if unknown.
+fn read_version_meta(sid: &str, manifest: &str) -> (u64, u64) {
+    let Some(v) = fs::read_to_string(version_meta_path(sid, manifest))
+        .ok()
+        .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+    else {
+        return (0, 0);
+    };
+    (
+        v.get("timeupdated").and_then(Value::as_u64).unwrap_or(0),
+        v.get("size").and_then(Value::as_u64).unwrap_or(0),
+    )
+}
+
+/// Format a Unix timestamp (seconds, UTC) as "YYYY-MM-DD HH:MM".
+fn fmt_date(secs: u64) -> String {
+    if secs == 0 {
+        return "unknown".into();
+    }
+    let days = (secs / 86400) as i64;
+    let sod = secs % 86400;
+    // civil-from-days (Howard Hinnant's algorithm), UTC.
+    let z = days + 719468;
+    let era = (if z >= 0 { z } else { z - 146096 }) / 146097;
+    let doe = (z - era * 146097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{y:04}-{m:02}-{d:02} {:02}:{:02}", sod / 3600, (sod % 3600) / 60)
 }
 
 /// Streaming SHA-256 of a file, hex-encoded. `manifest` (Steam's depot
@@ -956,6 +1020,18 @@ enum Mode {
     NameInput,
     Status,
     Help,
+    VersionPicker,
+}
+
+/// One selectable version of a Workshop mod in the `v` picker.
+struct VersionInfo {
+    manifest: String,
+    timeupdated: u64,
+    size: u64,
+    /// A faithful copy is in versioned_workshop_mods (can pin to it).
+    stored: bool,
+    /// Matches the version Steam has installed right now.
+    current: bool,
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -1087,6 +1163,11 @@ struct App {
     /// After L, watch twwh3-run's overlay-status file for a report newer
     /// than this launch epoch, to show which method the game launched with.
     overlay_watch_since: Option<u64>,
+    /// The `v` version picker: pool index of the mod, its versions, and
+    /// the highlighted row.
+    version_mod: Option<usize>,
+    versions: Vec<VersionInfo>,
+    version_state: ListState,
 }
 
 impl App {
@@ -1124,6 +1205,9 @@ impl App {
             status_lines: Vec::new(),
             preview_mounted: false,
             overlay_watch_since: None,
+            version_mod: None,
+            versions: Vec::new(),
+            version_state: ListState::default(),
         };
 
         // Initial load order: the current profile if it still exists, else
@@ -1248,7 +1332,7 @@ impl App {
             ));
         }
         Some(format!(
-            "Since '{name}' was saved: {} — L launches with pinned versions where stored",
+            "Since '{name}' was saved: {} — staying on pinned versions; v to pick, U to update all",
             parts.join("; ")
         ))
     }
@@ -1512,6 +1596,148 @@ impl App {
         self.dirty = true;
     }
 
+    // -- version updates ----------------------------------------------------
+
+    /// Store the current Workshop version of pool[i] and pin `id` to it,
+    /// so `s` moves the mod up to it. Returns true if the pin changed.
+    fn repin_current(&mut self, id: &str, i: usize) -> bool {
+        let Some(sid) = self.pool[i].steam_id.clone() else { return false };
+        let Some(w) = self.ws.get(&sid).filter(|w| !w.manifest.is_empty()) else {
+            return false;
+        };
+        let (current, tu, sz) = (w.manifest.clone(), w.timeupdated, w.size);
+        if self.pins.get(id) == Some(&current) {
+            return false;
+        }
+        let dir = self.pool[i].dir.clone();
+        let _ = store_mod_version(&sid, &current, &dir, tu, sz);
+        self.pins.insert(id.to_string(), current);
+        true
+    }
+
+    /// `U`: move every mod flagged (updated) to its current version.
+    fn update_all(&mut self) {
+        let targets: Vec<(String, usize)> = self
+            .slots
+            .iter()
+            .filter(|s| self.slot_updated(s))
+            .filter_map(|s| Some((s.id.clone(), s.idx?)))
+            .collect();
+        if targets.is_empty() {
+            self.status = "No mods have a newer Workshop version".into();
+            return;
+        }
+        let mut n = 0;
+        for (id, i) in &targets {
+            if self.repin_current(id, *i) {
+                n += 1;
+            }
+        }
+        if n > 0 {
+            self.dirty = true;
+            self.status = format!("{n} mods set to the current version — press s to save");
+        }
+    }
+
+    /// The pool index of the mod highlighted in the focused pane.
+    fn hovered_mod(&self) -> Option<usize> {
+        match self.focus {
+            Pane::Available => {
+                let avail = self.available();
+                self.avail_state
+                    .selected()
+                    .filter(|&s| s < avail.len())
+                    .map(|s| avail[s])
+            }
+            Pane::Profile => self
+                .prof_state
+                .selected()
+                .filter(|&s| s < self.slots.len())
+                .and_then(|s| self.slots[s].idx),
+        }
+    }
+
+    /// `v`: open the version picker for the highlighted Workshop mod —
+    /// every version we have stored plus the one Steam has installed now.
+    fn open_version_picker(&mut self) {
+        let Some(idx) = self.hovered_mod() else { return };
+        let Some(sid) = self.pool[idx].steam_id.clone() else {
+            self.status = "Local mods have no Workshop versions".into();
+            return;
+        };
+        let current = self.ws.get(&sid).map(|w| w.manifest.clone()).filter(|m| !m.is_empty());
+        let mut versions: Vec<VersionInfo> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        for e in fs::read_dir(versioned_mods_dir().join(&sid)).into_iter().flatten().flatten() {
+            if !e.path().is_dir() {
+                continue;
+            }
+            let Some(manifest) = e.file_name().to_str().map(String::from) else { continue };
+            let (tu, sz) = read_version_meta(&sid, &manifest);
+            let is_cur = current.as_deref() == Some(manifest.as_str());
+            seen.insert(manifest.clone());
+            versions.push(VersionInfo { manifest, timeupdated: tu, size: sz, stored: true, current: is_cur });
+        }
+        if let Some(cur) = &current {
+            if seen.insert(cur.clone()) {
+                let (tu, sz) = self.ws.get(&sid).map(|w| (w.timeupdated, w.size)).unwrap_or((0, 0));
+                versions.push(VersionInfo {
+                    manifest: cur.clone(),
+                    timeupdated: tu,
+                    size: sz,
+                    stored: false,
+                    current: true,
+                });
+            }
+        }
+        if versions.is_empty() {
+            self.status = "No versions stored for this mod yet (save or launch to store one)".into();
+            return;
+        }
+        versions.sort_by(|a, b| b.timeupdated.cmp(&a.timeupdated));
+        let id = self.pool[idx].id().to_string();
+        let sel = self
+            .pins
+            .get(&id)
+            .and_then(|p| versions.iter().position(|v| &v.manifest == p))
+            .or_else(|| versions.iter().position(|v| v.current))
+            .unwrap_or(0);
+        self.version_mod = Some(idx);
+        self.versions = versions;
+        self.version_state.select(Some(sel));
+        self.mode = Mode::VersionPicker;
+    }
+
+    /// Pin the selected mod to the highlighted version (storing it first
+    /// if needed) and return to Browse.
+    fn pick_version(&mut self) {
+        self.mode = Mode::Browse;
+        let (Some(idx), Some(sel)) = (self.version_mod, self.version_state.selected()) else {
+            return;
+        };
+        let Some(v) = self.versions.get(sel) else { return };
+        let (manifest, stored, tu) = (v.manifest.clone(), v.stored, v.timeupdated);
+        let Some(sid) = self.pool[idx].steam_id.clone() else { return };
+        let id = self.pool[idx].id().to_string();
+        let name = self.pool[idx].name().to_string();
+        // Make sure the chosen version is on disk so it resolves at launch.
+        if !stored {
+            let dir = self.pool[idx].dir.clone();
+            let (t, s) = self.ws.get(&sid).map(|w| (w.timeupdated, w.size)).unwrap_or((0, 0));
+            let _ = store_mod_version(&sid, &manifest, &dir, t, s);
+        }
+        if self.pins.get(&id) != Some(&manifest) {
+            self.dirty = true;
+        }
+        let is_current = self.ws.get(&sid).map(|w| w.manifest.as_str()) == Some(manifest.as_str());
+        self.pins.insert(id, manifest);
+        self.status = if is_current {
+            format!("'{name}' pinned to the current version ({}) — s to save", fmt_date(tu))
+        } else {
+            format!("'{name}' pinned to the {} version — s to save", fmt_date(tu))
+        };
+    }
+
     // -- saving -------------------------------------------------------------
 
     /// Save the current load order to its profile. The load order lives
@@ -1629,9 +1855,11 @@ impl App {
         }
     }
 
-    /// Write the profile with current version pins, vaulting each pinned
-    /// pack version that isn't vaulted yet. Returns how many pack
-    /// versions were newly vaulted.
+    /// Write the profile. Version pins are **sticky**: a mod already
+    /// pinned keeps its pinned version, so saving (e.g. to add other mods)
+    /// never bumps it — only a newly-added Workshop mod pins to the current
+    /// installed version. Use v (pick a version) or U (all) to move on
+    /// purpose. Returns how many pack versions were newly stored.
     fn write_modlist(&mut self, name: &str) -> Result<usize> {
         // Slots keep their id even when the mod is missing, so missing
         // mods survive a rewrite.
@@ -1643,15 +1871,34 @@ impl App {
                 o["local"] = Value::from(entry.local);
                 if let Some(sid) = &entry.steam_id {
                     o["steam_id"] = Value::from(sid.clone());
-                    if let Some(w) = self.ws.get(sid) {
-                        o["manifest"] = Value::from(w.manifest.clone());
-                        o["timeupdated"] = Value::from(w.timeupdated);
-                        o["size"] = Value::from(w.size);
-                        vaulted += store_mod_version(sid, &w.manifest, &entry.dir)?;
+                    let current = self
+                        .ws
+                        .get(sid)
+                        .map(|w| w.manifest.clone())
+                        .filter(|m| !m.is_empty());
+                    // Keep an existing pin; a new mod pins to current.
+                    let existing = self.pins.get(&s.id).cloned();
+                    if let Some(manifest) = existing.clone().or_else(|| current.clone()) {
+                        o["manifest"] = Value::from(manifest.clone());
+                        // Store only when freshly pinning the current
+                        // version; an existing pin is already stored (and
+                        // its bytes may no longer exist live, so don't copy
+                        // the newer files over the old version's folder).
+                        if existing.is_none() {
+                            let w = self.ws.get(sid);
+                            let (tu, sz) = w.map(|w| (w.timeupdated, w.size)).unwrap_or((0, 0));
+                            vaulted += store_mod_version(sid, &manifest, &entry.dir, tu, sz)?;
+                        }
+                        if current.as_deref() == Some(manifest.as_str()) {
+                            if let Some(w) = self.ws.get(sid) {
+                                o["timeupdated"] = Value::from(w.timeupdated);
+                                o["size"] = Value::from(w.size);
+                            }
+                        }
                         if let Some(hash) = entry
                             .packs
                             .first()
-                            .and_then(|p| stored_pack_path(sid, &w.manifest, p))
+                            .and_then(|p| stored_pack_path(sid, &manifest, p))
                             .and_then(|vp| read_or_make_sha256(&vp))
                         {
                             o["sha256"] = Value::from(hash);
@@ -1841,7 +2088,8 @@ impl App {
             if r.source == PackSource::Vault {
                 let e = &self.pool[r.idx];
                 if let (Some(sid), Some(m)) = (&e.steam_id, &r.manifest) {
-                    let _ = store_mod_version(sid, m, &e.dir);
+                    let (tu, sz) = self.ws.get(sid).map(|w| (w.timeupdated, w.size)).unwrap_or((0, 0));
+                    let _ = store_mod_version(sid, m, &e.dir, tu, sz);
                 }
             }
         }
@@ -2363,6 +2611,7 @@ fn draw(f: &mut Frame, app: &mut App) {
             Mode::Browse => " ? help · q quit",
             Mode::Profiles => " enter apply · r rename · n new · e export · d delete · esc close",
             Mode::NameInput => " enter confirm · esc cancel",
+            Mode::VersionPicker => " enter pin · j/k choose · esc cancel",
             Mode::Status | Mode::Help => " esc close",
         };
         Line::from(keys).style(Style::default().fg(Color::DarkGray))
@@ -2374,6 +2623,7 @@ fn draw(f: &mut Frame, app: &mut App) {
         Mode::NameInput => draw_name_input(f, app),
         Mode::Status => draw_status_popup(f, app),
         Mode::Help => draw_help_popup(f),
+        Mode::VersionPicker => draw_version_picker(f, app),
         Mode::Browse => {}
     }
 }
@@ -2390,6 +2640,8 @@ fn draw_help_popup(f: &mut Frame) {
         ("Load order", ""),
         ("space / enter", "add to / remove from the load order"),
         ("J / K", "reorder the selected mod"),
+        ("v", "pick which stored version of a Workshop mod to use"),
+        ("U", "update all mods flagged (updated) to current"),
         ("", ""),
         ("Profiles (p)", ""),
         ("enter", "apply the selected profile"),
@@ -2433,6 +2685,54 @@ fn draw_help_popup(f: &mut Frame) {
             .title_bottom(" esc close "),
     );
     f.render_widget(table, area);
+}
+
+/// The `v` version picker: the Workshop mod's stored versions + the one
+/// Steam has installed now, newest first, with update dates.
+fn draw_version_picker(f: &mut Frame, app: &mut App) {
+    let name = app.version_mod.map(|i| app.pool[i].name().to_string()).unwrap_or_default();
+    let id = app.version_mod.map(|i| app.pool[i].id().to_string()).unwrap_or_default();
+    let pinned = app.pins.get(&id).cloned();
+    let items: Vec<ListItem> = app
+        .versions
+        .iter()
+        .map(|v| {
+            let is_pinned = pinned.as_ref() == Some(&v.manifest);
+            let mut tags = String::new();
+            if v.current {
+                tags.push_str(" ·current");
+            }
+            if is_pinned {
+                tags.push_str(" ·pinned");
+            }
+            if !v.stored {
+                tags.push_str(" ·not stored");
+            }
+            let size = if v.size > 0 { human_size(v.size) } else { "-".into() };
+            let mut style = Style::default();
+            if v.current {
+                style = style.fg(Color::Green);
+            }
+            if is_pinned {
+                style = style.add_modifier(Modifier::BOLD);
+            }
+            ListItem::new(format!("{}   {:>9}{}", fmt_date(v.timeupdated), size, tags)).style(style)
+        })
+        .collect();
+    let full = f.area();
+    let h = (app.versions.len() as u16 + 2).clamp(3, full.height.saturating_sub(2));
+    let area = centered_rect(full.width.saturating_sub(8).min(72), h, full);
+    f.render_widget(Clear, area);
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(format!(" Versions of {name} — newest first "))
+                .title_bottom(" enter pin · esc cancel "),
+        )
+        .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
+        .highlight_symbol("▶ ");
+    f.render_stateful_widget(list, area, &mut app.version_state);
 }
 
 fn draw_status_popup(f: &mut Frame, app: &App) {
@@ -2885,6 +3185,8 @@ fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<()> {
                         app.status_lines = app.build_status();
                         app.mode = Mode::Status;
                     }
+                    KeyCode::Char('v') => app.open_version_picker(),
+                    KeyCode::Char('U') => app.update_all(),
                     KeyCode::Char('o') => app.toggle_data_view(),
                     KeyCode::Char('L') => app.launch(),
                     KeyCode::Char('?') => app.mode = Mode::Help,
@@ -2894,6 +3196,23 @@ fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<()> {
             Mode::Help => {
                 app.mode = Mode::Browse;
             }
+            Mode::VersionPicker => match key.code {
+                KeyCode::Char('q') | KeyCode::Esc | KeyCode::Char('v') => {
+                    app.mode = Mode::Browse;
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    let i = app.version_state.selected().unwrap_or(0);
+                    app.version_state.select(Some(i.saturating_sub(1)));
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    if !app.versions.is_empty() {
+                        let i = app.version_state.selected().unwrap_or(0);
+                        app.version_state.select(Some((i + 1).min(app.versions.len() - 1)));
+                    }
+                }
+                KeyCode::Enter | KeyCode::Char(' ') => app.pick_version(),
+                _ => {}
+            },
             Mode::Status => match key.code {
                 KeyCode::Char('q') | KeyCode::Esc | KeyCode::Char('S') | KeyCode::Enter
                 | KeyCode::Char(' ') => {
@@ -3027,6 +3346,10 @@ fn usage() {
            tab / h / l      switch pane   j/k or arrows        select\n  \
            space / enter    add to or remove from the load order\n  \
            J/K              reorder within the load order\n  \
+           v                pick which stored version of the hovered\n                    \
+           Workshop mod to use (with update dates)\n  \
+           U                update all '(updated)' mods to the current\n                    \
+           version (pins are otherwise kept on save)\n  \
            p                profiles (enter apply, n new, r rename,\n                    \
            e export, d delete)\n  \
            o                open the game's data/ folder as the game will\n                    \
@@ -3054,11 +3377,17 @@ fn usage() {
            needed. The load order lives in profiles; moddata.dat is read for\n  \
            Workshop names but never written (launch is overlay-only).\n\n\
          Versioning (Workshop only):\n  \
-           Profiles pin each Workshop mod's Steam manifest (depot GID for an\n  \
-           exact version) plus a sha256 and the game build id at save time;\n  \
-           the item is copied into versioned_workshop_mods (keyed by id +\n  \
-           manifest). When Steam force-updates a mod, the load order marks\n  \
-           it '(updated)' and L loads the pinned version from that store.\n  \
+           Each Workshop mod is pinned to a Steam manifest (depot GID for an\n  \
+           exact version); the item is copied into versioned_workshop_mods\n  \
+           (keyed by id + manifest). Pins are STICKY: saving keeps every\n  \
+           already-pinned mod on its version and only pins newly-added mods\n  \
+           to what's installed now — so adding a mod never bumps the others.\n  \
+           When Steam force-updates a pinned mod the load order marks it\n  \
+           '(updated)' and L keeps loading the pinned (old) version. Press v\n  \
+           on a Workshop mod to pick any stored version (shown with their\n  \
+           Steam update dates), or U to move every '(updated)' mod to the\n  \
+           current version; then s to save. Every version you use is kept in\n  \
+           versioned_workshop_mods/<id>/<manifest>/ so you can switch back.\n  \
            Local mods aren't versioned (you own them).\n\n\
          Staging & overlay:\n  \
            On launch each mod folder is mirrored into a staging folder of\n  \

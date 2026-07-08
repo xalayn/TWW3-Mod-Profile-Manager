@@ -27,12 +27,17 @@ Workshop at all.
 - **Profiles** — named mod lists you can switch between, and rename
   (`r`). Mods missing on disk are remembered, flagged, and skipped
   rather than lost.
-- **Version pinning (Workshop)** — saving a profile records each Workshop
-  mod's exact version (depot manifest) plus a `sha256`, and copies the
-  item into a local store (`versioned_workshop_mods/<id>/<manifest>/`).
-  When Steam force-updates a mod, the TUI flags it `(updated)` and launches
-  your pinned version from the store instead. Local mods aren't stored —
-  you own their files.
+- **Version pinning (Workshop)** — each Workshop mod is pinned to an exact
+  version (depot manifest), copied into a local store
+  (`versioned_workshop_mods/<id>/<manifest>/`). **Pins are sticky**: saving
+  keeps every already-pinned mod on its version and only pins newly-added
+  mods to what's installed now — so adding a mod never bumps the others.
+  When Steam force-updates a pinned mod the TUI flags it `(updated)` and
+  keeps launching your pinned (old) version. Press `v` on a Workshop mod to
+  **pick any stored version** (listed with their Steam update dates), or `U`
+  to move every `(updated)` mod to current — every version you use is kept
+  in `versioned_workshop_mods/<id>/<manifest>/`, so you can switch back.
+  Local mods aren't stored — you own their files.
 - **Portable setups** — Workshop mods launch from that store, so a setup
   never depends on the live Workshop folder (an unsubscribed mod still
   plays). `export` a profile to a single `.twwh3bundle.tar` (profile + its
