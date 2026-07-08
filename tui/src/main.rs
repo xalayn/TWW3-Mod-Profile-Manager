@@ -1,21 +1,21 @@
 //! twwh3-mods — TUI load-order manager for Total War: WARHAMMER III.
 //!
-//! Edits the same file the official launcher uses
-//! (Launcher/20190104-moddata.dat inside the game's Proton prefix), so
-//! changes made here show up in the launcher and vice versa. Fields this
-//! tool doesn't understand are preserved verbatim on save.
+//! A mod is a *folder* that gets mirrored into the game's data/ at launch:
+//! a Steam Workshop item dir (workshop/content/<appid>/<steam_id>/) or a
+//! local mod dir (mods/<name>/). Either may hold several .pack files plus
+//! loose assets (movies, tables); the packs are listed in used_mods, the
+//! whole folder rides along via the overlay. Local mods are first-class —
+//! you don't need Steam Workshop at all.
 //!
-//! Two panes: "Available" lists every mod installed on disk (launcher
-//! entries plus a scan of the Steam workshop content folder, so fresh
-//! subscriptions show up immediately, marked "new"). The "Load order"
-//! pane is the current profile: the ordered list of mods that will be
-//! enabled; every mod not in it is saved as inactive. Profile entries
-//! whose mod is not installed are shown as missing, skipped when
-//! enabling, and preserved in the profile file.
+//! Two panes: "Available" lists every mod on disk (Workshop scan + local
+//! folders); "Load order" is the ordered list that will be enabled. The
+//! load order lives in profiles (TWWH3_MODLISTS, default
+//! ~/Games/TotalWarWH3/modlists); the launcher's moddata.dat is read for
+//! Workshop names and to seed a first-run load order, but is never
+//! written — launching goes through twwh3-run's staging/overlay.
 //!
-//! Mod-list profiles are stored as JSON files in TWWH3_MODLISTS
-//! (default: ~/Games/TotalWarWH3/modlists), independent of the
-//! full-folder snapshots made by twwh3-profile.
+//! Profile entries whose mod isn't installed are shown as missing, skipped
+//! at launch, and preserved in the profile file.
 
 use anyhow::{bail, Context, Result};
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
@@ -136,7 +136,8 @@ fn workshop_dir() -> PathBuf {
         .unwrap_or_else(|| steam_root().join(format!("steamapps/workshop/content/{APPID}")))
 }
 
-/// Drop .pack files here to use mods from outside the Steam Workshop.
+/// Put a subfolder here per local (non-Workshop) mod: mods/<name>/ holding
+/// its .pack file(s) and any loose assets, mirrored into the game's data/.
 fn local_mods_dir() -> PathBuf {
     path_setting("TWWH3_LOCAL", "local_mods").unwrap_or_else(|| data_dir().join("mods"))
 }
@@ -151,13 +152,6 @@ fn vault_dir() -> PathBuf {
 /// vaulted pin, or local mod). Rebuilt on every launch.
 fn staging_dir() -> PathBuf {
     path_setting("TWWH3_STAGING", "staging").unwrap_or_else(|| data_dir().join("staging"))
-}
-
-/// Convert a wine path like "Z:/home/x/y.pack" to a unix path.
-fn win_to_unix(p: &str) -> Option<PathBuf> {
-    let p = p.replace('\\', "/");
-    let rest = p.strip_prefix("Z:").or_else(|| p.strip_prefix("z:"))?;
-    Some(PathBuf::from(rest))
 }
 
 /// Convert a unix path to the wine path the game sees under Proton.
@@ -286,101 +280,145 @@ enum Thumb {
     Ready(StatefulProtocol),
 }
 
+/// A mod is a folder mirrored into the game's data/: a Steam Workshop
+/// item dir (workshop/content/<appid>/<steam_id>/) or a local mod dir
+/// (mods/<name>/). Either may hold several .pack files (+ loose assets
+/// for local mods).
 struct ModEntry {
-    data: Value,
-    pack_path: Option<PathBuf>,
+    /// The mod's folder on disk.
+    dir: PathBuf,
+    /// Stable identity: steam_id for Workshop, folder name for local.
+    id: String,
+    /// Display name (Workshop title from moddata, else folder name).
+    name: String,
+    /// .pack files in the folder, sorted — the used_mods lines.
+    packs: Vec<PathBuf>,
+    /// Combined size of the packs, if known.
     size: Option<u64>,
+    /// Workshop item id (Some = Workshop mod, None = local).
     steam_id: Option<String>,
+    /// Preview image for the thumbnail, if any.
     png: Option<PathBuf>,
     thumb: Thumb,
-    /// Found on disk but not yet known to the launcher.
-    discovered: bool,
     /// From the local mods dir rather than the Steam Workshop.
     local: bool,
-    /// Pack file no longer exists on disk (unsubscribed / not downloaded).
+    /// Workshop category (from moddata), for display only.
+    category: String,
+    /// Workshop description snippet (from moddata), for display only.
+    short: String,
+    /// The folder is gone / has no packs.
     missing: bool,
 }
 
-impl ModEntry {
-    fn new(data: Value) -> Self {
-        let pack_path = data
-            .get("packfile")
-            .and_then(Value::as_str)
-            .and_then(win_to_unix);
-        let (size, steam_id, png) = match &pack_path {
-            Some(p) => {
-                let size = fs::metadata(p).ok().map(|m| m.len());
-                // Workshop packs live in .../workshop/content/<appid>/<steam_id>/
-                let steam_id = p
-                    .parent()
-                    .and_then(Path::file_name)
-                    .and_then(|s| s.to_str())
-                    .filter(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()))
-                    .map(String::from);
-                let png = Some(p.with_extension("png"))
-                    .filter(|c| c.exists())
-                    .or_else(|| {
-                        fs::read_dir(p.parent()?).ok()?.flatten().map(|e| e.path()).find(
-                            |q| q.extension().is_some_and(|e| e.eq_ignore_ascii_case("png")),
-                        )
-                    });
-                (size, steam_id, png)
+/// Every file under `root`, as (path relative to root, absolute path).
+fn walk_files(root: &Path) -> Vec<(PathBuf, PathBuf)> {
+    fn rec(base: &Path, dir: &Path, out: &mut Vec<(PathBuf, PathBuf)>) {
+        let Ok(rd) = fs::read_dir(dir) else { return };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                rec(base, &p, out);
+            } else if let Ok(rel) = p.strip_prefix(base) {
+                out.push((rel.to_path_buf(), p.clone()));
             }
-            None => (None, None, None),
-        };
-        let missing = pack_path.as_ref().is_none_or(|p| !p.exists());
-        ModEntry {
-            data,
-            pack_path,
+        }
+    }
+    let mut out = Vec::new();
+    rec(root, root, &mut out);
+    out
+}
+
+/// The .pack files directly discoverable under `dir` (any depth), sorted.
+fn packs_in(dir: &Path) -> Vec<PathBuf> {
+    let mut packs: Vec<PathBuf> = walk_files(dir)
+        .into_iter()
+        .map(|(_, abs)| abs)
+        .filter(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("pack")))
+        .collect();
+    packs.sort();
+    packs
+}
+
+/// A preview image in `dir` (any file with a .png extension), if present.
+fn find_png(dir: &Path) -> Option<PathBuf> {
+    fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("png")))
+}
+
+impl ModEntry {
+    /// Build a mod from its folder. `steam_id` Some marks it a Workshop
+    /// mod. Returns None if the folder has no .pack files.
+    fn from_dir(dir: PathBuf, steam_id: Option<String>, name: String, local: bool) -> Option<Self> {
+        let packs = packs_in(&dir);
+        if packs.is_empty() {
+            return None;
+        }
+        let size = packs
+            .iter()
+            .filter_map(|p| fs::metadata(p).ok().map(|m| m.len()))
+            .sum::<u64>()
+            .into();
+        let png = find_png(&dir);
+        let id = steam_id.clone().unwrap_or_else(|| {
+            dir.file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("?")
+                .to_string()
+        });
+        Some(ModEntry {
+            dir,
+            id,
+            name,
+            packs,
             size,
             steam_id,
             png,
             thumb: Thumb::NotLoaded,
-            discovered: false,
-            local: false,
-            missing,
-        }
+            local,
+            category: String::new(),
+            short: String::new(),
+            missing: false,
+        })
+    }
+
+    fn id(&self) -> &str {
+        &self.id
     }
 
     fn name(&self) -> &str {
-        self.data
-            .get("name")
-            .and_then(Value::as_str)
-            .or_else(|| self.uuid())
-            .unwrap_or("<unnamed>")
-    }
-
-    fn uuid(&self) -> Option<&str> {
-        self.data.get("uuid").and_then(Value::as_str)
-    }
-
-    fn active(&self) -> bool {
-        self.data.get("active").and_then(Value::as_bool).unwrap_or(false)
-    }
-
-    fn set(&mut self, key: &str, value: Value) {
-        if let Some(obj) = self.data.as_object_mut() {
-            obj.insert(key.into(), value);
-        }
+        &self.name
     }
 
     fn category(&self) -> &str {
-        match self.data.get("category").and_then(Value::as_str) {
-            Some("") | None => "-",
-            Some(c) => c,
+        if self.category.is_empty() {
+            "-"
+        } else {
+            &self.category
         }
     }
 
-    /// Workshop description snippet with BBCode-style [tags] stripped.
+    /// The mod's files to mirror into data/, as (relative path, source).
+    /// Workshop mods mirror only their packs (flat, at data/ root); local
+    /// mods mirror their whole folder tree so loose assets travel too.
+    fn files(&self) -> Vec<(PathBuf, PathBuf)> {
+        if self.local {
+            walk_files(&self.dir)
+        } else {
+            self.packs
+                .iter()
+                .filter_map(|p| Some((PathBuf::from(p.file_name()?), p.clone())))
+                .collect()
+        }
+    }
+
+    /// Description snippet with BBCode-style [tags] stripped.
     fn description(&self) -> String {
-        let raw = self
-            .data
-            .get("short")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        let mut out = String::with_capacity(raw.len());
+        let mut out = String::with_capacity(self.short.len());
         let mut in_tag = false;
-        for c in raw.chars() {
+        for c in self.short.chars() {
             match c {
                 '[' => in_tag = true,
                 ']' => in_tag = false,
@@ -393,126 +431,136 @@ impl ModEntry {
     }
 }
 
-/// Scan the Steam workshop content folder for pack files the launcher
-/// doesn't know about yet and append them as entries.
-fn discover_workshop_mods(mods: &mut Vec<ModEntry>) {
-    let known: HashSet<String> = mods
-        .iter()
-        .filter_map(|m| m.uuid())
-        .map(str::to_lowercase)
-        .collect();
-    let Ok(items) = fs::read_dir(workshop_dir()) else { return };
-    let mut found: Vec<ModEntry> = Vec::new();
-    for item in items.flatten() {
-        let Ok(files) = fs::read_dir(item.path()) else { continue };
-        for f in files.flatten() {
-            let p = f.path();
-            if !p.extension().is_some_and(|e| e.eq_ignore_ascii_case("pack")) {
-                continue;
-            }
-            let Some(fname) = p.file_name().and_then(|s| s.to_str()) else { continue };
-            // The launcher uses the lowercased pack file name as the uuid.
-            let uuid = fname.to_lowercase();
-            if known.contains(&uuid) {
-                continue;
-            }
-            let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or(fname);
-            let data = serde_json::json!({
-                "uuid": uuid,
-                "order": 0,
-                "active": false,
-                "game": GAME,
-                "packfile": format!("Z:{}", p.display()),
-                "name": stem,
-                "short": "",
-                "category": "",
-                "owned": false,
-            });
-            let mut e = ModEntry::new(data);
-            e.discovered = true;
-            found.push(e);
-        }
-    }
-    found.sort_by(|a, b| a.name().to_lowercase().cmp(&b.name().to_lowercase()));
-    mods.extend(found);
+/// Per-pack metadata the CA launcher recorded, keyed by lowercased pack
+/// file name. Read-only — used for Workshop names/descriptions and to
+/// seed the initial load order, never written back.
+struct ModMeta {
+    name: String,
+    category: String,
+    short: String,
+    active: bool,
+    order: i64,
 }
 
-/// Scan the local mods dir for .pack files (mods from outside the
-/// Steam Workshop) and append them as entries.
-fn discover_local_mods(mods: &mut Vec<ModEntry>) {
-    let dir = local_mods_dir();
-    let _ = fs::create_dir_all(&dir);
-    let known: HashSet<String> = mods
-        .iter()
-        .filter_map(|m| m.uuid())
-        .map(str::to_lowercase)
-        .collect();
-    let Ok(files) = fs::read_dir(&dir) else { return };
-    let mut found: Vec<ModEntry> = Vec::new();
-    for f in files.flatten() {
-        let p = f.path();
-        if !p.extension().is_some_and(|e| e.eq_ignore_ascii_case("pack")) {
+fn read_moddata_meta() -> HashMap<String, ModMeta> {
+    let mut map = HashMap::new();
+    let Ok(text) = fs::read_to_string(moddata_path()) else { return map };
+    let Ok(root) = serde_json::from_str::<Value>(&text) else { return map };
+    let Some(arr) = root.as_array() else { return map };
+    for m in arr {
+        if m.get("game").and_then(Value::as_str) != Some(GAME) {
             continue;
         }
-        let Some(fname) = p.file_name().and_then(|s| s.to_str()) else { continue };
-        let uuid = fname.to_lowercase();
-        if known.contains(&uuid) {
+        let Some(uuid) = m.get("uuid").and_then(Value::as_str) else { continue };
+        map.insert(
+            uuid.to_lowercase(),
+            ModMeta {
+                name: m.get("name").and_then(Value::as_str).unwrap_or("").to_string(),
+                category: m.get("category").and_then(Value::as_str).unwrap_or("").to_string(),
+                short: m.get("short").and_then(Value::as_str).unwrap_or("").to_string(),
+                active: m.get("active").and_then(Value::as_bool).unwrap_or(false),
+                order: m.get("order").and_then(Value::as_i64).unwrap_or(i64::MAX),
+            },
+        );
+    }
+    map
+}
+
+/// Build the mod pool: every Workshop item dir and every local mod dir
+/// that contains at least one .pack. `meta` supplies Workshop names from
+/// the launcher's moddata.
+fn discover_mods(meta: &HashMap<String, ModMeta>) -> Vec<ModEntry> {
+    let mut pool: Vec<ModEntry> = Vec::new();
+
+    // Workshop items: workshop/content/<appid>/<steam_id>/
+    for item in fs::read_dir(workshop_dir()).into_iter().flatten().flatten() {
+        let dir = item.path();
+        if !dir.is_dir() {
             continue;
         }
-        let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or(fname);
-        let data = serde_json::json!({
-            "uuid": uuid,
-            "order": 0,
-            "active": false,
-            "game": GAME,
-            "packfile": format!("Z:{}", p.display()),
-            "name": stem,
-            "short": "",
-            "category": "",
-            "owned": true,
+        let steam_id = dir
+            .file_name()
+            .and_then(|s| s.to_str())
+            .filter(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()))
+            .map(String::from);
+        let packs = packs_in(&dir);
+        let Some(first) = packs.first() else { continue };
+        // Name/metadata from moddata, matched by any of the item's packs.
+        let m = packs.iter().find_map(|p| {
+            let key = p.file_name()?.to_str()?.to_lowercase();
+            meta.get(&key)
         });
-        let mut e = ModEntry::new(data);
-        e.discovered = true;
-        e.local = true;
-        found.push(e);
+        let name = m
+            .map(|m| m.name.clone())
+            .filter(|n| !n.is_empty())
+            .unwrap_or_else(|| {
+                first.file_stem().and_then(|s| s.to_str()).unwrap_or("?").to_string()
+            });
+        if let Some(mut e) = ModEntry::from_dir(dir, steam_id, name, false) {
+            if let Some(m) = m {
+                e.category = m.category.clone();
+                e.short = m.short.clone();
+            }
+            pool.push(e);
+        }
     }
-    found.sort_by(|a, b| a.name().to_lowercase().cmp(&b.name().to_lowercase()));
-    mods.extend(found);
+
+    // Local mods: each subfolder of the local mods dir with packs.
+    let ldir = local_mods_dir();
+    let _ = fs::create_dir_all(&ldir);
+    for item in fs::read_dir(&ldir).into_iter().flatten().flatten() {
+        let p = item.path();
+        if !p.is_dir() {
+            continue;
+        }
+        let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("?").to_string();
+        if let Some(e) = ModEntry::from_dir(p, None, name, true) {
+            pool.push(e);
+        }
+    }
+
+    pool.sort_by(|a, b| a.name().to_lowercase().cmp(&b.name().to_lowercase()));
+    pool
 }
 
-/// Copy a mod's pack (+ thumbnail) into the vault under its manifest id,
-/// unless that exact version is already vaulted. Returns true if copied.
-fn vault_pack(entry: &ModEntry, manifest: &str) -> Result<bool> {
-    let (Some(sid), Some(pack)) = (&entry.steam_id, &entry.pack_path) else {
-        return Ok(false);
-    };
-    if manifest.is_empty() || entry.missing {
-        return Ok(false);
+/// Copy all of a Workshop mod's packs (+ preview) into
+/// vault/<sid>/<manifest>/, skipping any already present. Records a
+/// sha256 sidecar per pack. Returns how many packs were newly vaulted.
+fn vault_mod(sid: &str, manifest: &str, packs: &[PathBuf], png: Option<&Path>) -> Result<usize> {
+    if manifest.is_empty() {
+        return Ok(0);
     }
     let dst_dir = vault_dir().join(sid).join(manifest);
-    let Some(fname) = pack.file_name() else { return Ok(false) };
-    let dst = dst_dir.join(fname);
-    if dst.exists() {
-        return Ok(false);
+    let mut n = 0usize;
+    for pack in packs {
+        if !pack.exists() {
+            continue;
+        }
+        let Some(fname) = pack.file_name() else { continue };
+        let dst = dst_dir.join(fname);
+        if dst.exists() {
+            continue;
+        }
+        fs::create_dir_all(&dst_dir)
+            .with_context(|| format!("could not create {}", dst_dir.display()))?;
+        // Copy to a temp name first so an interrupted copy can't be
+        // mistaken for a complete vaulted version.
+        let tmp = dst_dir.join(format!(".{}.tmp", fname.to_string_lossy()));
+        fs::copy(pack, &tmp).with_context(|| format!("could not vault {}", pack.display()))?;
+        fs::rename(&tmp, &dst)?;
+        // Record a content hash beside the pack so a version can be
+        // verified independently of Steam (used when importing a bundle).
+        if let Some(hash) = pack_sha256(&dst) {
+            let _ = fs::write(sha256_sidecar(&dst), hash);
+        }
+        n += 1;
     }
-    fs::create_dir_all(&dst_dir)
-        .with_context(|| format!("could not create {}", dst_dir.display()))?;
-    // Copy to a temp name first so an interrupted copy can't be mistaken
-    // for a complete vaulted version.
-    let tmp = dst_dir.join(format!(".{}.tmp", fname.to_string_lossy()));
-    fs::copy(pack, &tmp).with_context(|| format!("could not vault {}", pack.display()))?;
-    fs::rename(&tmp, &dst)?;
-    // Record a content hash beside the pack so a version can be verified
-    // independently of Steam (used when importing a shared bundle).
-    if let Some(hash) = pack_sha256(&dst) {
-        let _ = fs::write(sha256_sidecar(&dst), hash);
-    }
-    if let Some(png) = &entry.png {
+    if let Some(png) = png {
         if let Some(png_name) = png.file_name() {
             let _ = fs::copy(png, dst_dir.join(png_name));
         }
     }
-    Ok(true)
+    Ok(n)
 }
 
 /// Streaming SHA-256 of a file, hex-encoded. `manifest` (Steam's depot
@@ -579,53 +627,49 @@ fn tar_append_bytes<W: std::io::Write>(
     Ok(())
 }
 
-/// The content hash of a vaulted pack version, read from its sidecar (or
-/// computed and cached if the sidecar is absent — e.g. an older vault).
-fn vaulted_sha256(entry: &ModEntry, manifest: &str) -> Option<String> {
-    let pack = vaulted_pack(entry, manifest)?;
-    let sidecar = sha256_sidecar(&pack);
+/// The content hash of a vaulted pack, from its sidecar (or computed and
+/// cached if the sidecar is absent — e.g. an older vault).
+fn read_or_make_sha256(pack: &Path) -> Option<String> {
+    let sidecar = sha256_sidecar(pack);
     if let Ok(s) = fs::read_to_string(&sidecar) {
         let s = s.trim().to_string();
         if !s.is_empty() {
             return Some(s);
         }
     }
-    let hash = pack_sha256(&pack)?;
+    let hash = pack_sha256(pack)?;
     let _ = fs::write(&sidecar, &hash);
     Some(hash)
 }
 
-/// Rebuild the staging folder so it contains exactly one link per pack
-/// in `packs`, in place of whatever it held before. Only symlinks are
-/// ever removed; a regular file squatting on a pack's name is an error
-/// rather than something to silently delete.
-fn rebuild_staging(staging: &Path, packs: &[PathBuf]) -> Result<()> {
+/// Rebuild the staging folder to mirror `entries` — each (relative path,
+/// source) becomes a symlink at staging/<rel> pointing at the source.
+/// Parent dirs are created; later entries override earlier ones (load-
+/// order precedence). The folder is rebuilt from scratch each launch.
+fn rebuild_staging(staging: &Path, entries: &[(PathBuf, PathBuf)]) -> Result<()> {
+    if staging.exists() {
+        fs::remove_dir_all(staging)
+            .with_context(|| format!("could not clear staging dir {}", staging.display()))?;
+    }
     fs::create_dir_all(staging)
         .with_context(|| format!("could not create staging dir {}", staging.display()))?;
-    for entry in fs::read_dir(staging)? {
-        let p = entry?.path();
-        if p.symlink_metadata()?.file_type().is_symlink() {
-            fs::remove_file(&p)?;
+    for (rel, src) in entries {
+        let dst = staging.join(rel);
+        if let Some(parent) = dst.parent() {
+            fs::create_dir_all(parent)?;
         }
-    }
-    for src in packs {
-        let Some(fname) = src.file_name() else { continue };
-        let dst = staging.join(fname);
-        symlink(src, &dst).with_context(|| {
-            format!(
-                "could not link {} into staging ({}) — remove any real file by that name",
-                fname.to_string_lossy(),
-                staging.display()
-            )
-        })?;
+        if dst.symlink_metadata().is_ok() {
+            let _ = fs::remove_file(&dst);
+        }
+        symlink(src, &dst)
+            .with_context(|| format!("could not link {} into staging", rel.display()))?;
     }
     Ok(())
 }
 
-/// Where the vaulted copy of a specific mod version lives, if it exists.
-fn vaulted_pack(entry: &ModEntry, manifest: &str) -> Option<PathBuf> {
-    let sid = entry.steam_id.as_ref()?;
-    let fname = entry.pack_path.as_ref()?.file_name()?;
+/// Where a specific vaulted pack version lives, if it exists.
+fn vaulted_pack_path(sid: &str, manifest: &str, pack: &Path) -> Option<PathBuf> {
+    let fname = pack.file_name()?;
     let p = vault_dir().join(sid).join(manifest).join(fname);
     p.exists().then_some(p)
 }
@@ -917,10 +961,10 @@ enum Pane {
     Profile,
 }
 
-/// One position in the load order: a mod uuid, resolved to the pool
-/// where possible. `idx: None` means the mod is not installed at all.
+/// One position in the load order: a mod id, resolved to the pool where
+/// possible. `idx: None` means the mod is not installed at all.
 struct Slot {
-    uuid: String,
+    id: String,
     idx: Option<usize>,
 }
 
@@ -930,24 +974,36 @@ struct PreviewLine {
     updated: bool,
 }
 
-/// A profile entry as stored on disk (v2 adds version pins).
+/// A profile entry as stored on disk. `id` is the mod key (Workshop
+/// steam_id or local folder name); Workshop entries also pin a version.
 struct MlEntry {
-    uuid: String,
+    id: String,
+    local: bool,
     steam_id: Option<String>,
     manifest: Option<String>,
     sha256: Option<String>,
 }
 
-/// Where a resolved pack loads from at launch.
+/// The mod key of a stored profile entry, tolerating older profiles:
+/// explicit `id`, else `steam_id` (Workshop), else legacy `uuid`.
+fn ml_entry_id(e: &Value) -> Option<String> {
+    e.get("id")
+        .and_then(Value::as_str)
+        .or_else(|| e.get("steam_id").and_then(Value::as_str))
+        .or_else(|| e.get("uuid").and_then(Value::as_str))
+        .map(String::from)
+}
+
+/// Where a resolved mod's files load from at launch.
 #[derive(PartialEq, Clone, Copy)]
 enum PackSource {
-    /// Current version, served from the vault (vaulted on demand).
+    /// Current Workshop version, served from the vault (vaulted on demand).
     Vault,
-    /// Pinned version from the vault (Steam has updated past the pin).
+    /// Pinned Workshop version from the vault (Steam updated past the pin).
     Pinned,
-    /// A local (non-Workshop) pack, loaded from its file.
+    /// A local folder mod, loaded from its folder.
     Local,
-    /// Steam mod with no known manifest — loaded live from the workshop.
+    /// Workshop mod with no known manifest — loaded live from the workshop.
     Workshop,
 }
 
@@ -962,23 +1018,38 @@ impl PackSource {
     }
 }
 
-/// One entry of the resolved load order: the exact pack the game will
-/// load, in order. `fname` is the `mod "…";` token written to used_mods.
-struct ResolvedPack {
+/// One mod of the resolved load order: its files to mirror into data/
+/// (relative path, source) and the pack basenames for used_mods.
+struct ResolvedMod {
     name: String,
-    fname: String,
-    path: PathBuf,
+    files: Vec<(PathBuf, PathBuf)>,
+    packs: Vec<String>,
     source: PackSource,
-    pool_idx: usize,
+    /// Pool index, so launch can vault the mod's current version.
+    idx: usize,
+    /// Chosen Workshop manifest (None for local / unknown).
     manifest: Option<String>,
 }
 
+/// Keep the last occurrence of each key, preserving order — load-order
+/// override: a later mod's file/pack wins over an earlier one's.
+fn dedup_last<T, K: Eq + std::hash::Hash>(v: Vec<T>, key: impl Fn(&T) -> K) -> Vec<T> {
+    let mut seen = HashSet::new();
+    let mut out: Vec<T> = Vec::new();
+    for item in v.into_iter().rev() {
+        if seen.insert(key(&item)) {
+            out.push(item);
+        }
+    }
+    out.reverse();
+    out
+}
+
 struct App {
+    /// The launcher moddata file, read for Workshop names/seed (not written).
     path: PathBuf,
-    /// Every known mod: launcher entries + workshop scan. Never reordered.
+    /// Every known mod (Workshop + local folders). Never reordered.
     pool: Vec<ModEntry>,
-    /// Entries for other games in the same file, preserved untouched.
-    others: Vec<Value>,
     /// The load order: mods in here are enabled, in this order.
     slots: Vec<Slot>,
     focus: Pane,
@@ -1017,52 +1088,16 @@ struct App {
 
 impl App {
     fn load(path: PathBuf, picker: Option<Picker>) -> Result<Self> {
-        let text = fs::read_to_string(&path).with_context(|| {
-            format!(
-                "could not read launcher mod data at {}\n\
-                 Has the game's launcher been run at least once?\n\
-                 Set TWWH3_MODDATA or STEAM_ROOT if your Steam library lives elsewhere.",
-                path.display()
-            )
-        })?;
-        let root: Value = serde_json::from_str(&text)
-            .with_context(|| format!("could not parse {} as JSON", path.display()))?;
-        let Value::Array(entries) = root else {
-            bail!("{}: expected a JSON array", path.display());
-        };
-        let (mut wh3, others): (Vec<Value>, Vec<Value>) = entries
-            .into_iter()
-            .partition(|m| m.get("game").and_then(Value::as_str) == Some(GAME));
-        wh3.sort_by_key(|m| m.get("order").and_then(Value::as_i64).unwrap_or(i64::MAX));
-        let mut pool: Vec<ModEntry> = wh3.into_iter().map(ModEntry::new).collect();
-        discover_workshop_mods(&mut pool);
-        discover_local_mods(&mut pool);
-        // Entries the launcher already adopted from the local dir.
-        for m in &mut pool {
-            if !m.local {
-                m.local = m
-                    .pack_path
-                    .as_ref()
-                    .is_some_and(|p| p.starts_with(local_mods_dir()));
-            }
-        }
-
-        // Initial load order: the launcher's active mods, in its order.
-        let slots: Vec<Slot> = pool
-            .iter()
-            .enumerate()
-            .filter(|(_, m)| m.active() && m.uuid().is_some())
-            .map(|(i, m)| Slot {
-                uuid: m.uuid().unwrap_or_default().to_lowercase(),
-                idx: Some(i),
-            })
-            .collect();
+        // moddata is read only for Workshop names + to seed the initial
+        // load order; it's optional (a Workshop-free setup has none). The
+        // pool is built by scanning the Workshop and local mod folders.
+        let meta = read_moddata_meta();
+        let pool = discover_mods(&meta);
 
         let mut app = App {
             path,
             pool,
-            others,
-            slots,
+            slots: Vec::new(),
             focus: Pane::Profile,
             avail_state: TableState::default(),
             prof_state: TableState::default(),
@@ -1087,6 +1122,23 @@ impl App {
             preview_mounted: false,
             overlay_watch_since: None,
         };
+
+        // Initial load order: the current profile if it still exists, else
+        // seed from the launcher's active mods so existing setups carry.
+        app.current_profile = fs::read_to_string(current_profile_file())
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|n| !n.is_empty())
+            .filter(|n| modlists_dir().join(format!("{n}.json")).exists());
+        match app.current_profile.clone() {
+            Some(name) => {
+                app.slots = app.slots_for_profile(&name);
+                app.load_pins(&name);
+                app.status = app.drift_report().unwrap_or_default();
+            }
+            None => app.slots = app.slots_from_moddata(&meta),
+        }
+
         if !app.slots.is_empty() {
             app.prof_state.select(Some(0));
         }
@@ -1096,17 +1148,44 @@ impl App {
         if app.slots.is_empty() {
             app.focus = Pane::Available;
         }
-        // Restore which profile we were on, if it still exists.
-        app.current_profile = fs::read_to_string(current_profile_file())
-            .ok()
-            .map(|s| s.trim().to_string())
-            .filter(|n| !n.is_empty())
-            .filter(|n| modlists_dir().join(format!("{n}.json")).exists());
-        if let Some(name) = app.current_profile.clone() {
-            app.load_pins(&name);
-            app.status = app.drift_report().unwrap_or_default();
-        }
         Ok(app)
+    }
+
+    /// Resolve a profile's entries to load-order slots against the pool.
+    fn slots_for_profile(&self, name: &str) -> Vec<Slot> {
+        Self::read_modlist(name)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|e| {
+                let idx = self.pool.iter().position(|m| m.id().eq_ignore_ascii_case(&e.id));
+                Slot { id: e.id, idx }
+            })
+            .collect()
+    }
+
+    /// Seed the load order from the launcher's active mods (mapped to
+    /// their folders) so users with no profile keep their current setup.
+    fn slots_from_moddata(&self, meta: &HashMap<String, ModMeta>) -> Vec<Slot> {
+        let mut active: Vec<(&String, &ModMeta)> = meta.iter().filter(|(_, m)| m.active).collect();
+        active.sort_by_key(|(_, m)| m.order);
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut slots = Vec::new();
+        for (packname, _) in active {
+            let Some(idx) = self.pool.iter().position(|e| {
+                e.packs.iter().any(|p| {
+                    p.file_name()
+                        .and_then(|s| s.to_str())
+                        .is_some_and(|s| s.eq_ignore_ascii_case(packname))
+                })
+            }) else {
+                continue;
+            };
+            let id = self.pool[idx].id().to_string();
+            if seen.insert(id.clone()) {
+                slots.push(Slot { id, idx: Some(idx) });
+            }
+        }
+        slots
     }
 
     /// Load the version pins recorded in a profile file.
@@ -1125,18 +1204,17 @@ impl App {
             .and_then(Value::as_str)
             .map(String::from);
         for e in root.get("mods").and_then(Value::as_array).into_iter().flatten() {
-            if let (Some(uuid), Some(man)) = (
-                e.get("uuid").and_then(Value::as_str),
-                e.get("manifest").and_then(Value::as_str),
-            ) {
-                self.pins.insert(uuid.to_lowercase(), man.to_string());
+            if let (Some(id), Some(man)) =
+                (ml_entry_id(e), e.get("manifest").and_then(Value::as_str))
+            {
+                self.pins.insert(id, man.to_string());
             }
         }
     }
 
     /// The pinned manifest differs from what's installed now.
     fn slot_updated(&self, s: &Slot) -> bool {
-        let Some(pinned) = self.pins.get(&s.uuid) else { return false };
+        let Some(pinned) = self.pins.get(&s.id) else { return false };
         let Some(i) = s.idx else { return false };
         let Some(sid) = &self.pool[i].steam_id else { return false };
         self.ws
@@ -1284,15 +1362,15 @@ impl App {
         if self.dirty {
             v.push(StatusLine::new("unsaved changes", "yes — press s to save", Some(false)));
         }
-        let installed = self.pool.iter().filter(|m| !m.missing).count();
+        let total = self.pool.len();
         let local = self.pool.iter().filter(|m| m.local).count();
-        let new = self.pool.iter().filter(|m| m.discovered).count();
-        let mut pool = format!("{installed} installed");
+        let workshop = total - local;
+        let mut pool = format!("{total} mods");
+        if workshop > 0 {
+            pool.push_str(&format!(", {workshop} workshop"));
+        }
         if local > 0 {
             pool.push_str(&format!(", {local} local"));
-        }
-        if new > 0 {
-            pool.push_str(&format!(", {new} new"));
         }
         v.push(StatusLine::new("mod pool", pool, None));
         let (versions, bytes) = vault_stats();
@@ -1389,8 +1467,8 @@ impl App {
             return;
         };
         let i = avail[sel];
-        let Some(uuid) = self.pool[i].uuid().map(str::to_lowercase) else { return };
-        self.slots.push(Slot { uuid, idx: Some(i) });
+        let id = self.pool[i].id().to_string();
+        self.slots.push(Slot { id, idx: Some(i) });
         self.dirty = true;
         let left = avail.len() - 1;
         self.avail_state
@@ -1433,69 +1511,24 @@ impl App {
 
     // -- saving -------------------------------------------------------------
 
+    /// Save the current load order to its profile. The load order lives
+    /// only in profiles now — the launcher's moddata is never written.
     fn save(&mut self) -> Result<()> {
-        let backup = self.save_moddata()?;
-        let enabled = self.slots.iter().filter(|s| !self.slot_missing(s)).count();
-        self.status = match self.current_profile.clone() {
-            Some(name) => match self.write_modlist(&name) {
-                Ok(vaulted) if vaulted > 0 => format!(
-                    "Saved: {enabled} mods enabled + profile '{name}', {vaulted} pack versions vaulted (backup: {backup})"
-                ),
-                Ok(_) => format!(
-                    "Saved: {enabled} mods enabled + profile '{name}' (backup: {backup})"
-                ),
-                Err(e) => format!("Saved mods, but updating profile '{name}' failed: {e:#}"),
-            },
-            None => format!("Saved: {enabled} mods enabled (backup: {backup})"),
+        let Some(name) = self.current_profile.clone() else {
+            self.status =
+                "No profile selected — press p then n to save this load order as one".into();
+            return Ok(());
         };
-        Ok(())
-    }
-
-    /// Write the launcher moddata file only. Returns the backup file name.
-    fn save_moddata(&mut self) -> Result<String> {
-        // Mods in the load order become active (unless their pack is
-        // gone) and come first; everything else is inactive, after them.
-        let in_order: Vec<usize> = self.slots.iter().filter_map(|s| s.idx).collect();
-        let used: HashSet<usize> = in_order.iter().copied().collect();
-        let mut sequence = in_order;
-        sequence.extend((0..self.pool.len()).filter(|i| !used.contains(i)));
-
-        for i in 0..self.pool.len() {
-            self.pool[i].set("active", Value::Bool(false));
-        }
-        for s in &self.slots {
-            if let Some(i) = s.idx {
-                if !self.pool[i].missing {
-                    self.pool[i].set("active", Value::Bool(true));
-                }
+        let enabled = self.slots.iter().filter(|s| !self.slot_missing(s)).count();
+        self.status = match self.write_modlist(&name) {
+            Ok(vaulted) if vaulted > 0 => {
+                format!("Saved '{name}': {enabled} mods, {vaulted} pack versions vaulted")
             }
-        }
-        let mut all: Vec<Value> = Vec::with_capacity(self.pool.len() + self.others.len());
-        for (n, &i) in sequence.iter().enumerate() {
-            self.pool[i].set("order", Value::from(n as i64 + 1));
-            all.push(self.pool[i].data.clone());
-        }
-        all.extend(self.others.iter().cloned());
-        let text = serde_json::to_string(&Value::Array(all))?;
-
-        let file_name = self
-            .path
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("moddata.dat")
-            .to_string();
-        if self.path.exists() {
-            let backup = self.path.with_file_name(format!("{file_name}.bak"));
-            fs::copy(&self.path, &backup).context("could not create backup")?;
-        }
-        // Write to a temp file and rename so a failed write can't truncate
-        // the launcher's data.
-        let tmp = self.path.with_file_name(format!("{file_name}.tmp"));
-        fs::write(&tmp, &text)?;
-        fs::rename(&tmp, &self.path)?;
-
+            Ok(_) => format!("Saved '{name}': {enabled} mods"),
+            Err(e) => format!("Saving '{name}' failed: {e:#}"),
+        };
         self.dirty = false;
-        Ok(format!("{file_name}.bak"))
+        Ok(())
     }
 
     // -- profiles -----------------------------------------------------------
@@ -1543,20 +1576,16 @@ impl App {
         Ok(entries
             .iter()
             .filter_map(|e| {
+                let steam_id = e.get("steam_id").and_then(Value::as_str).map(String::from);
                 Some(MlEntry {
-                    uuid: e.get("uuid").and_then(Value::as_str)?.to_string(),
-                    steam_id: e
-                        .get("steam_id")
-                        .and_then(Value::as_str)
-                        .map(String::from),
-                    manifest: e
-                        .get("manifest")
-                        .and_then(Value::as_str)
-                        .map(String::from),
-                    sha256: e
-                        .get("sha256")
-                        .and_then(Value::as_str)
-                        .map(String::from),
+                    id: ml_entry_id(e)?,
+                    local: e
+                        .get("local")
+                        .and_then(Value::as_bool)
+                        .unwrap_or_else(|| steam_id.is_none()),
+                    steam_id,
+                    manifest: e.get("manifest").and_then(Value::as_str).map(String::from),
+                    sha256: e.get("sha256").and_then(Value::as_str).map(String::from),
                 })
             })
             .collect())
@@ -1573,10 +1602,7 @@ impl App {
         self.preview.clear();
         let Some(name) = name else { return };
         for e in Self::read_modlist(&name).unwrap_or_default() {
-            let known = self
-                .pool
-                .iter()
-                .find(|m| m.uuid().is_some_and(|u| u.eq_ignore_ascii_case(&e.uuid)));
+            let known = self.pool.iter().find(|m| m.id().eq_ignore_ascii_case(&e.id));
             let updated = match (&known, &e.manifest) {
                 (Some(m), Some(pinned)) => m
                     .steam_id
@@ -1592,7 +1618,7 @@ impl App {
                     updated,
                 },
                 None => PreviewLine {
-                    label: e.uuid,
+                    label: e.id,
                     missing: true,
                     updated: false,
                 },
@@ -1604,23 +1630,27 @@ impl App {
     /// pack version that isn't vaulted yet. Returns how many pack
     /// versions were newly vaulted.
     fn write_modlist(&mut self, name: &str) -> Result<usize> {
-        // Slots keep their uuid even when the mod is not installed, so
-        // missing mods survive a rewrite.
+        // Slots keep their id even when the mod is missing, so missing
+        // mods survive a rewrite.
         let mut vaulted = 0usize;
         let mut mods: Vec<Value> = Vec::with_capacity(self.slots.len());
         for s in &self.slots {
-            let mut o = serde_json::json!({ "uuid": s.uuid, "active": true });
+            let mut o = serde_json::json!({ "id": s.id, "active": true });
             if let Some(entry) = s.idx.map(|i| &self.pool[i]) {
+                o["local"] = Value::from(entry.local);
                 if let Some(sid) = &entry.steam_id {
                     o["steam_id"] = Value::from(sid.clone());
                     if let Some(w) = self.ws.get(sid) {
                         o["manifest"] = Value::from(w.manifest.clone());
                         o["timeupdated"] = Value::from(w.timeupdated);
                         o["size"] = Value::from(w.size);
-                        if vault_pack(entry, &w.manifest)? {
-                            vaulted += 1;
-                        }
-                        if let Some(hash) = vaulted_sha256(entry, &w.manifest) {
+                        vaulted += vault_mod(sid, &w.manifest, &entry.packs, entry.png.as_deref())?;
+                        if let Some(hash) = entry
+                            .packs
+                            .first()
+                            .and_then(|p| vaulted_pack_path(sid, &w.manifest, p))
+                            .and_then(|vp| read_or_make_sha256(&vp))
+                        {
                             o["sha256"] = Value::from(hash);
                         }
                     }
@@ -1663,33 +1693,19 @@ impl App {
     }
 
     fn apply_profile(&mut self, name: &str) -> Result<()> {
-        let entries = Self::read_modlist(name)?;
-        self.slots = entries
-            .into_iter()
-            .map(|e| {
-                let idx = self
-                    .pool
-                    .iter()
-                    .position(|m| m.uuid().is_some_and(|u| u.eq_ignore_ascii_case(&e.uuid)));
-                Slot {
-                    uuid: e.uuid.to_lowercase(),
-                    idx,
-                }
-            })
-            .collect();
+        // read_modlist errors surface here (bad JSON etc.).
+        Self::read_modlist(name)?;
+        self.slots = self.slots_for_profile(name);
         let missing = self.slots.iter().filter(|s| self.slot_missing(s)).count();
         self.prof_state
             .select(if self.slots.is_empty() { None } else { Some(0) });
         if self.avail_state.selected().is_none() && !self.available().is_empty() {
             self.avail_state.select(Some(0));
         }
-        self.dirty = true;
+        // The load order now matches the saved profile; nothing unsaved.
+        self.dirty = false;
         self.set_current(Some(name.to_string()));
         self.load_pins(name);
-        // Switching profiles takes effect immediately — but only the
-        // launcher file is written; the profile file (and its version
-        // pins) is left untouched so drift stays visible.
-        self.save_moddata()?;
         let mut notes = Vec::new();
         if missing > 0 {
             notes.push(format!("{missing} missing (kept in profile, not enabled)"));
@@ -1711,116 +1727,140 @@ impl App {
 
     // -- launching ----------------------------------------------------------
 
-    /// The load order resolved to concrete packs, in launch order, deduped
-    /// by file name, with missing/unresolvable mods skipped. This is the
-    /// single source of truth for both launch (`write_used_mods`) and the
-    /// dry-run preview (`used_mods_preview`), so the two can never drift.
-    /// Read-only: for a not-yet-vaulted current version it returns the
-    /// vault path it *will* load from; the caller materializes it.
-    fn resolve_load_order(&self) -> Vec<ResolvedPack> {
-        let mut out: Vec<ResolvedPack> = Vec::new();
+    /// The load order resolved to concrete mods, in launch order. Shared
+    /// by launch (`write_used_mods`) and the dry-run (`used_mods_preview`)
+    /// so the two never drift. Read-only: for a not-yet-vaulted Workshop
+    /// version it returns the vault path it *will* load from; the caller
+    /// materializes it. Missing mods are skipped.
+    fn resolve_load_order(&self) -> Vec<ResolvedMod> {
+        let mut out: Vec<ResolvedMod> = Vec::new();
         for s in &self.slots {
             let Some(idx) = s.idx else { continue };
             let entry = &self.pool[idx];
             if entry.missing {
                 continue;
             }
-            let Some(live) = &entry.pack_path else { continue };
-            let Some(fname) = live.file_name().and_then(|f| f.to_str()).map(String::from) else {
-                continue;
-            };
-            // When Steam has moved past the profile's pin and we have the
-            // pinned version vaulted, load that; otherwise the current
-            // version (from the vault; local mods from their file).
-            let (path, source, manifest) = if self.slot_updated(s) {
-                match self.pins.get(&s.uuid).and_then(|m| vaulted_pack(entry, m)) {
-                    Some(v) => (v, PackSource::Pinned, self.pins.get(&s.uuid).cloned()),
-                    None => self.resolve_current(entry, live),
-                }
-            } else {
-                self.resolve_current(entry, live)
-            };
-            if out.iter().any(|r| r.fname == fname) {
+            let packs: Vec<String> = entry
+                .packs
+                .iter()
+                .filter_map(|p| p.file_name()?.to_str().map(String::from))
+                .collect();
+            if entry.local {
+                out.push(ResolvedMod {
+                    name: entry.name().to_string(),
+                    source: PackSource::Local,
+                    files: entry.files(),
+                    packs,
+                    idx,
+                    manifest: None,
+                });
                 continue;
             }
-            out.push(ResolvedPack {
+            // Workshop: pick the version (pinned or current) and mirror its
+            // packs (flat, at data/ root) from the vault.
+            let sid = entry.steam_id.clone().unwrap_or_default();
+            let (manifest, source) = self.workshop_source(entry, s);
+            let files: Vec<(PathBuf, PathBuf)> = entry
+                .packs
+                .iter()
+                .filter_map(|live| {
+                    let name = live.file_name()?;
+                    let src = match &manifest {
+                        Some(m) => vault_dir().join(&sid).join(m).join(name),
+                        None => live.clone(),
+                    };
+                    Some((PathBuf::from(name), src))
+                })
+                .collect();
+            out.push(ResolvedMod {
                 name: entry.name().to_string(),
-                fname,
-                path,
                 source,
-                pool_idx: idx,
+                files,
+                packs,
+                idx,
                 manifest,
             });
         }
         out
     }
 
-    /// Where the *current* installed version of `entry` loads from at
-    /// launch: the vault (steam mods, vaulted on demand) or the file
-    /// itself (local mods, or steam mods with no known manifest).
-    fn resolve_current(&self, entry: &ModEntry, live: &Path) -> (PathBuf, PackSource, Option<String>) {
-        let Some(sid) = &entry.steam_id else {
-            return (live.to_path_buf(), PackSource::Local, None);
-        };
-        if entry.local {
-            return (live.to_path_buf(), PackSource::Local, None);
+    /// The Workshop version to load: the pinned one when Steam has moved
+    /// past it and it's vaulted, else the current manifest (served from
+    /// the vault), else None (no manifest known — load live).
+    fn workshop_source(&self, entry: &ModEntry, s: &Slot) -> (Option<String>, PackSource) {
+        let sid = entry.steam_id.as_deref().unwrap_or("");
+        if self.slot_updated(s) {
+            if let Some(pin) = self.pins.get(&s.id) {
+                if vault_dir().join(sid).join(pin).is_dir() {
+                    return (Some(pin.clone()), PackSource::Pinned);
+                }
+            }
         }
         match self.ws.get(sid).map(|w| w.manifest.clone()).filter(|m| !m.is_empty()) {
-            Some(manifest) => {
-                let path = live
-                    .file_name()
-                    .map(|f| vault_dir().join(sid).join(&manifest).join(f))
-                    .unwrap_or_else(|| live.to_path_buf());
-                (path, PackSource::Vault, Some(manifest))
-            }
-            None => (live.to_path_buf(), PackSource::Workshop, None),
+            Some(m) => (Some(m), PackSource::Vault),
+            None => (None, PackSource::Workshop),
         }
     }
 
-    /// Generate used_mods.txt in the game dir from the load order, using
-    /// the shared resolver. Each mod is materialized as a symlink in the
-    /// staging folder pointing into the vault (pinned or current version,
-    /// vaulted on demand), which twwh3-run overlays onto the game's data/
-    /// (or, without fuse-overlayfs, becomes the mod working directory).
-    /// Because staging points into the vault, a launch never depends on
-    /// the Steam workshop folder. `ls -l` on staging shows the full
-    /// resolution. Returns (mods, pinned).
+    /// The staging mirror entries (rel, src) for the resolved order,
+    /// deduped so a later mod overrides an earlier one. Each file falls
+    /// back to the mod folder when its vault source isn't present.
+    fn staging_entries(&self, resolved: &[ResolvedMod]) -> Vec<(PathBuf, PathBuf)> {
+        let mut flat: Vec<(PathBuf, PathBuf)> = Vec::new();
+        for r in resolved {
+            let dir = &self.pool[r.idx].dir;
+            for (rel, src) in &r.files {
+                let src = if src.exists() { src.clone() } else { dir.join(rel) };
+                flat.push((rel.clone(), src));
+            }
+        }
+        dedup_last(flat, |(rel, _)| rel.clone())
+    }
+
+    /// used_mods `mod "…";` pack basenames for the resolved order, in load
+    /// order, deduped (later wins).
+    fn used_mods_lines(resolved: &[ResolvedMod]) -> Vec<String> {
+        let flat: Vec<String> = resolved.iter().flat_map(|r| r.packs.clone()).collect();
+        dedup_last(flat, |s| s.clone())
+    }
+
+    /// Generate used_mods.txt in the game dir from the load order. Each
+    /// mod's folder is mirrored into the staging folder (Workshop mods
+    /// mirror their packs from the vault, vaulted on demand; local mods
+    /// mirror their whole folder), which twwh3-run overlays onto data/ (or
+    /// becomes the mod working directory). Because Workshop packs resolve
+    /// through the vault, a launch never depends on the live workshop
+    /// folder. `ls -lR` on staging shows the resolution. Returns
+    /// (mods, pinned).
     fn write_used_mods(&self) -> Result<(usize, usize)> {
         let game_dir = game_install_dir().context(
             "could not find the game install dir (steamapps/common/Total War WARHAMMER III)",
         )?;
         let resolved = self.resolve_load_order();
-        // Vault current versions on demand so their symlinks resolve; the
-        // pinned ones are already vaulted (that's how they were resolved).
-        let mut packs: Vec<PathBuf> = Vec::with_capacity(resolved.len());
+        // Vault current Workshop versions on demand so their symlinks
+        // resolve; pinned ones are already vaulted.
         for r in &resolved {
             if r.source == PackSource::Vault {
-                if let Some(m) = &r.manifest {
-                    let _ = vault_pack(&self.pool[r.pool_idx], m);
+                let e = &self.pool[r.idx];
+                if let (Some(sid), Some(m)) = (&e.steam_id, &r.manifest) {
+                    let _ = vault_mod(sid, m, &e.packs, e.png.as_deref());
                 }
             }
-            // Fall back to the live pack if a vault write didn't land, so
-            // staging never holds a dangling link.
-            if r.path.exists() {
-                packs.push(r.path.clone());
-            } else {
-                packs.push(self.pool[r.pool_idx].pack_path.clone().unwrap_or_else(|| r.path.clone()));
-            }
         }
+        let entries = self.staging_entries(&resolved);
+        let lines = Self::used_mods_lines(&resolved);
         let pinned = resolved.iter().filter(|r| r.source == PackSource::Pinned).count();
-        let staging = staging_dir();
-        rebuild_staging(&staging, &packs)?;
-        // Two lists: used_mods.txt loads packs from the staging folder
-        // (no overlay needed); used_mods_overlay.txt has mod lines only,
-        // for when twwh3-run has merged staging into data/. Loading from
-        // both places at once would present every pack twice and confuse
-        // the game's save-game mod matching, so the shim picks exactly
-        // one depending on whether the mount succeeded.
-        let mut out = format!("add_working_directory \"{}\";\n", unix_to_win(&staging));
+        rebuild_staging(&staging_dir(), &entries)?;
+        // Two lists: used_mods.txt loads packs from the staging folder (no
+        // overlay); used_mods_overlay.txt has mod lines only, for when
+        // twwh3-run has merged staging into data/. Loading from both at
+        // once would present every pack twice and confuse save-game mod
+        // matching, so the shim picks exactly one.
+        let mut out = format!("add_working_directory \"{}\";\n", unix_to_win(&staging_dir()));
         let mut overlay_out = String::new();
-        for r in &resolved {
-            out.push_str(&format!("mod \"{}\";\n", r.fname));
-            overlay_out.push_str(&format!("mod \"{}\";\n", r.fname));
+        for name in &lines {
+            out.push_str(&format!("mod \"{name}\";\n"));
+            overlay_out.push_str(&format!("mod \"{name}\";\n"));
         }
         fs::write(game_dir.join("used_mods.txt"), out)
             .with_context(|| format!("could not write used_mods.txt in {}", game_dir.display()))?;
@@ -1831,18 +1871,26 @@ impl App {
     }
 
     /// Render exactly what a launch would pass to the game, without
-    /// writing anything or touching the vault — the ordered load order,
-    /// each mod's resolved source, and the literal contents of both
-    /// used_mods files. Shares `resolve_load_order` with the real launch,
-    /// so the mod lines and their order are byte-identical to a launch.
+    /// writing anything or touching the vault. Shares the resolver with
+    /// the real launch, so the mod lines and their order are identical.
     fn used_mods_preview(&self) -> String {
         let resolved = self.resolve_load_order();
+        let lines = Self::used_mods_lines(&resolved);
         let staging = staging_dir();
         let overlay = setting("TWWH3_OVERLAY", "overlay").unwrap_or_else(|| "on".into());
         let mut s = String::new();
-        s.push_str(&format!("Load order — {} packs, in launch order:\n", resolved.len()));
+        s.push_str(&format!(
+            "Load order — {} mods ({} packs), in launch order:\n",
+            resolved.len(),
+            lines.len()
+        ));
         for (n, r) in resolved.iter().enumerate() {
-            s.push_str(&format!("{:>3}  {}  [{}]\n", n + 1, r.name, r.source.label()));
+            let pk = if r.packs.len() == 1 {
+                String::new()
+            } else {
+                format!(", {} packs", r.packs.len())
+            };
+            s.push_str(&format!("{:>3}  {}  [{}{}]\n", n + 1, r.name, r.source.label(), pk));
         }
         let missing = self.slots.iter().filter(|s| self.slot_missing(s)).count();
         if missing > 0 {
@@ -1858,13 +1906,13 @@ impl App {
             );
         }
         s.push_str("----- used_mods_overlay.txt (packs merged into data/) -----\n");
-        for r in &resolved {
-            s.push_str(&format!("mod \"{}\";\n", r.fname));
+        for name in &lines {
+            s.push_str(&format!("mod \"{name}\";\n"));
         }
         s.push_str("\n----- used_mods.txt (fallback / overlay off) -----\n");
         s.push_str(&format!("add_working_directory \"{}\";\n", unix_to_win(&staging)));
-        for r in &resolved {
-            s.push_str(&format!("mod \"{}\";\n", r.fname));
+        for name in &lines {
+            s.push_str(&format!("mod \"{name}\";\n"));
         }
         s
     }
@@ -2060,7 +2108,8 @@ impl App {
             "schema": 1,
             "profile": name,
             "mods": entries.iter().map(|e| serde_json::json!({
-                "uuid": e.uuid,
+                "id": e.id,
+                "local": e.local,
                 "steam_id": e.steam_id,
                 "manifest": e.manifest,
                 "sha256": e.sha256,
@@ -2070,11 +2119,28 @@ impl App {
         // The profile file itself, applied verbatim on import.
         tar.append_path_with_name(&profile_path, "profile.json")?;
 
-        // Every file of each mod's pinned vault version (pack, png, sidecar).
+        // Each mod's files: Workshop from its vaulted version (pack, png,
+        // sidecar); local mods from their whole folder.
         let vault = vault_dir();
         let mut packs = 0usize;
         let mut missing = 0usize;
         for e in &entries {
+            if e.local {
+                let src = local_mods_dir().join(&e.id);
+                let mut has_pack = false;
+                for (rel, abs) in walk_files(&src) {
+                    tar.append_path_with_name(&abs, format!("local/{}/{}", e.id, rel.display()))?;
+                    if abs.extension().is_some_and(|x| x.eq_ignore_ascii_case("pack")) {
+                        has_pack = true;
+                    }
+                }
+                if has_pack {
+                    packs += 1;
+                } else {
+                    missing += 1;
+                }
+                continue;
+            }
             let (Some(sid), Some(manifest)) = (&e.steam_id, &e.manifest) else {
                 missing += 1;
                 continue;
@@ -2138,6 +2204,19 @@ impl App {
                     continue;
                 }
                 let dst = vault.join(rel);
+                if let Some(parent) = dst.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                entry.unpack(&dst)?;
+            } else if let Ok(rel) = arc.strip_prefix("local") {
+                // local/<id>/<file> -> <local mods dir>/<id>/<file>
+                if rel.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+                    bail!("bundle contains an unsafe path: {name}");
+                }
+                if rel.as_os_str().is_empty() || entry.header().entry_type().is_dir() {
+                    continue;
+                }
+                let dst = local_mods_dir().join(rel);
                 if let Some(parent) = dst.parent() {
                     fs::create_dir_all(parent)?;
                 }
@@ -2432,13 +2511,16 @@ fn draw_available(f: &mut Frame, app: &mut App, area: Rect) {
             let m = &app.pool[i];
             let name_style = if m.local {
                 Style::default().fg(Color::Magenta)
-            } else if m.discovered {
-                Style::default().fg(Color::Green)
             } else {
                 Style::default()
             };
+            let label = if m.packs.len() > 1 {
+                format!("{} ({} packs)", m.name(), m.packs.len())
+            } else {
+                m.name().to_string()
+            };
             Row::new(vec![
-                Cell::from(m.name().to_string()).style(name_style),
+                Cell::from(label).style(name_style),
                 Cell::from(format!(
                     "{:>9}",
                     m.size.map(human_size).unwrap_or_else(|| "-".into())
@@ -2481,7 +2563,7 @@ fn draw_profile(f: &mut Frame, app: &mut App, area: Rect) {
                     Style::default().fg(Color::Red),
                 ),
                 None => (
-                    format!("{} (missing)", s.uuid),
+                    format!("{} (missing)", s.id),
                     Style::default().fg(Color::Red),
                 ),
             };
@@ -2530,7 +2612,7 @@ fn side_panel_subject(app: &App) -> SidePanelSubject {
         {
             Some(slot) => match slot.idx {
                 Some(i) => SidePanelSubject::Mod(i),
-                None => SidePanelSubject::Unknown(slot.uuid.clone()),
+                None => SidePanelSubject::Unknown(slot.id.clone()),
             },
             None => SidePanelSubject::None,
         },
@@ -2598,6 +2680,10 @@ fn draw_side_panel(f: &mut Frame, app: &mut App, area: Rect) {
             Style::default().add_modifier(Modifier::BOLD),
         )),
         Line::from(vec![
+            Span::styled("kind: ", label),
+            Span::raw(if entry.local { "local" } else { "workshop" }.to_string()),
+        ]),
+        Line::from(vec![
             Span::styled("category: ", label),
             Span::raw(entry.category().to_string()),
         ]),
@@ -2606,36 +2692,30 @@ fn draw_side_panel(f: &mut Frame, app: &mut App, area: Rect) {
             Span::raw(entry.steam_id.clone().unwrap_or_else(|| "-".into())),
         ]),
         Line::from(vec![
-            Span::styled("pack: ", label),
-            Span::raw(
-                entry
-                    .pack_path
-                    .as_ref()
-                    .and_then(|p| p.file_name())
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("?")
-                    .to_string(),
-            ),
+            Span::styled("folder: ", label),
+            Span::raw(tilde(&entry.dir)),
         ]),
-        Line::from(""),
+        Line::from(vec![
+            Span::styled("packs: ", label),
+            Span::raw(entry.packs.len().to_string()),
+        ]),
     ];
+    for p in entry.packs.iter().take(8) {
+        if let Some(n) = p.file_name().and_then(|s| s.to_str()) {
+            lines.push(Line::from(format!("  {n}")).style(label));
+        }
+    }
+    lines.push(Line::from(""));
     if entry.missing {
         lines.insert(
             1,
-            Line::from("missing — pack file not found (unsubscribed or not downloaded)")
-                .style(Style::default().fg(Color::Red)),
+            Line::from("missing — folder not found").style(Style::default().fg(Color::Red)),
         );
     } else if entry.local {
         lines.insert(
             1,
-            Line::from("local mod — loaded from the local mods dir, not Steam Workshop")
+            Line::from("local mod — a folder mirrored into data/")
                 .style(Style::default().fg(Color::Magenta)),
-        );
-    } else if entry.discovered {
-        lines.insert(
-            1,
-            Line::from("new — not in the launcher list yet; added when you save")
-                .style(Style::default().fg(Color::Green)),
         );
     }
     for l in entry.description().lines().take(12) {
@@ -2964,24 +3044,30 @@ fn usage() {
            (twwh3-run ships alongside this tool.) Without it, the CA\n  \
            launcher opens as usual and uses the same mod list, minus\n  \
            version pinning.\n\n\
-         Local (non-Workshop) mods:\n  \
-           Drop .pack files into ~/Games/TotalWarWH3/mods (TWWH3_LOCAL) and\n  \
-           they appear under Available, marked 'local'. They load from that\n  \
-           folder directly — no need to copy them into the game's data dir.\n\n\
-         Versioning:\n  \
-           Profiles pin each mod's Steam manifest (Steam's depot GID for an\n  \
-           exact version) plus a sha256 of the pack, and the game build id,\n  \
-           at save time; the packs themselves are copied into the vault.\n  \
-           When Steam force-updates a mod, the load order marks it\n  \
-           '(updated)' and L loads the pinned version from the vault.\n\n\
+         Mods are folders:\n  \
+           A mod is a folder mirrored into the game's data/. Workshop items\n  \
+           (workshop/content/<appid>/<id>/) and local mods each are folders\n  \
+           holding one or more .pack files (+ loose assets for local mods).\n  \
+           For a local mod, make a subfolder of ~/Games/TotalWarWH3/mods\n  \
+           (TWWH3_LOCAL) — e.g. mods/MyMod/ — put its .pack(s) at the folder\n  \
+           root and any loose files (movies/, etc.) in matching subdirs;\n  \
+           it appears under Available marked 'local'. No Steam Workshop\n  \
+           needed. The load order lives in profiles; moddata.dat is read for\n  \
+           Workshop names but never written (launch is overlay-only).\n\n\
+         Versioning (Workshop only):\n  \
+           Profiles pin each Workshop mod's Steam manifest (depot GID for an\n  \
+           exact version) plus a sha256 and the game build id at save time;\n  \
+           the packs are copied into the vault. When Steam force-updates a\n  \
+           mod, the load order marks it '(updated)' and L loads the pinned\n  \
+           version from the vault. Local mods aren't vaulted (you own them).\n\n\
          Staging & overlay:\n  \
-           On launch the load order is materialized as a folder of symlinks\n  \
-           (default: ~/Games/TotalWarWH3/staging), one per mod, each\n  \
-           pointing into the vault — the current version (vaulted on demand)\n  \
-           or the pinned one where Steam has moved on. Local mods load from\n  \
-           their file. `ls -l` there shows the resolution. Because staging\n  \
-           resolves into the vault, a launch never depends on the Steam\n  \
-           workshop folder, and an unsubscribed mod still plays.\n  \
+           On launch each mod folder is mirrored into a staging folder of\n  \
+           symlinks (default: ~/Games/TotalWarWH3/staging) — Workshop packs\n  \
+           resolve through the vault (current version, vaulted on demand, or\n  \
+           the pinned one); local folders mirror as-is. `ls -lR` there shows\n  \
+           the resolution. Because Workshop packs resolve through the vault,\n  \
+           a launch never depends on the live workshop folder and an\n  \
+           unsubscribed mod still plays.\n  \
            twwh3-run then merges the staging folder into the game's data/\n  \
            with fuse-overlayfs for the duration of the run (movie packs\n  \
            work; game files stay pristine). Without fuse-overlayfs it\n  \
@@ -3119,20 +3205,14 @@ fn main() -> Result<()> {
                     if app.slot_updated(s) { "  (updated)" } else { "" },
                 ),
                 Some(i) => (app.pool[i].name(), "  (missing)"),
-                None => (s.uuid.as_str(), "  (missing)"),
+                None => (s.id.as_str(), "  (missing)"),
             };
             out.push_str(&format!("{:>3}  {name}{note}\n", n + 1));
         }
         out.push_str("\nAvailable:\n");
         for i in app.available() {
             let m = &app.pool[i];
-            let note = if m.local {
-                "  (local)"
-            } else if m.discovered {
-                "  (new)"
-            } else {
-                ""
-            };
+            let note = if m.local { "  (local)" } else { "" };
             out.push_str(&format!("     {}{note}\n", m.name()));
         }
         // Ignore broken pipes from e.g. `--list | head`.

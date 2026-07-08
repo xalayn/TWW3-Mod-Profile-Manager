@@ -9,35 +9,40 @@ Proton). Three tools, one shared config:
 | `twwh3-run` | Steam launch-option shim that boots the game with your mod list, skipping the CA launcher |
 | `twwh3-profile` | Full-folder snapshots of the game's settings/saves (Roaming folder) |
 
-`twwh3-mods` edits the same file the official launcher uses, so changes
-made in either show up in both.
+A **mod is a folder** mirrored into the game's `data/` — a Steam Workshop
+item or a local mod dir, either of which may hold several `.pack` files
+plus loose assets. Local mods are first-class; you don't need Steam
+Workshop at all.
 
 ## Features
 
-- **Two-pane TUI** — every installed mod (Steam Workshop + local) on the
-  left, your ordered load order on the right. Fresh Workshop
-  subscriptions appear immediately, marked `new`.
+- **Two-pane TUI** — every mod (Steam Workshop items + local folders) on
+  the left, your ordered load order on the right. Multi-pack mods show a
+  pack count; local mods are marked `local`.
+- **Mods are folders** — a mod is `workshop/content/<appid>/<id>/` or a
+  `mods/<name>/` folder. Put its `.pack`(s) at the folder root and any
+  loose files (movies, tables) in matching subdirs; the whole folder is
+  mirrored into `data/` at launch. The load order lives in profiles; the
+  launcher's `moddata.dat` is read for Workshop names but never written.
 - **Profiles** — named mod lists you can switch between, and rename
   (`r`). Mods missing on disk are remembered, flagged, and skipped
   rather than lost.
-- **Version pinning** — saving a profile records each mod's exact Steam
-  Workshop version (depot manifest) plus a `sha256` of the pack, and
-  copies the pack into a local vault. When Steam force-updates a mod, the
-  TUI flags it `(updated)` and launches with your pinned version from the
-  vault instead.
-- **Portable setups** — the load order always launches from the vault, so
-  a setup never depends on the live Workshop folder (an unsubscribed mod
-  still plays). `export` a profile to a single `.twwh3bundle.tar` (profile
-  + its packs) to move it to another machine or share it; `import` unpacks
-  it back into the vault, verifying each pack's `sha256`.
-- **Local mods** — drop `.pack` files into `~/Games/TotalWarWH3/mods`
-  and they show up alongside Workshop mods. No copying into the game
-  directory.
-- **Staging** — at launch, the load order is materialized as a folder
-  of symlinks (`~/Games/TotalWarWH3/staging`), one per mod, each
-  pointing into the vault at the exact version the game will read (the
-  current one, vaulted on demand, or the pinned one). Local mods point at
-  their file. `ls -l` there shows the whole resolution.
+- **Version pinning (Workshop)** — saving a profile records each Workshop
+  mod's exact version (depot manifest) plus a `sha256`, and copies the
+  packs into a local vault. When Steam force-updates a mod, the TUI flags
+  it `(updated)` and launches your pinned version from the vault instead.
+  Local mods aren't vaulted — you own their files.
+- **Portable setups** — Workshop mods launch from the vault, so a setup
+  never depends on the live Workshop folder (an unsubscribed mod still
+  plays). `export` a profile to a single `.twwh3bundle.tar` (profile + its
+  Workshop packs + local mod folders) to move it to another machine or
+  share it; `import` unpacks it back, verifying each pack's `sha256`.
+- **Local mods** — make a subfolder under `~/Games/TotalWarWH3/mods` per
+  mod; it shows up alongside Workshop mods, no copying into the game dir.
+- **Staging** — at launch each mod folder is mirrored into a staging
+  folder of symlinks (`~/Games/TotalWarWH3/staging`): Workshop packs
+  resolve through the vault (current or pinned version), local folders
+  mirror as-is. `ls -lR` there shows the whole resolution.
 - **Overlay mounting** — `twwh3-run` merges the staging folder into the game's
   `data/` directory with a fuse-overlayfs mount for the duration of the
   run. Mods that only load from `data/` (movie packs) just work, the

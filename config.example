@@ -18,7 +18,9 @@
 # Vaulted pack versions for update pinning (twwh3-mods).
 #vault = ~/Games/TotalWarWH3/vault
 
-# Drop .pack files here to use mods from outside the Steam Workshop.
+# Local (non-Workshop) mods: one subfolder per mod (mods/<name>/) holding
+# its .pack file(s) at the folder root plus any loose assets in matching
+# subdirs; the whole folder is mirrored into the game's data/ at launch.
 #local_mods = ~/Games/TotalWarWH3/mods
 
 # Staging folder: rebuilt on every launch with one symlink per enabled
