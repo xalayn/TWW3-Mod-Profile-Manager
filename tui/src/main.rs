@@ -40,7 +40,8 @@ use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::thread;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const APPID: u32 = 1142710;
 const GAME: &str = "warhammer3";
@@ -719,6 +720,114 @@ fn find_fuse_overlayfs() -> Option<PathBuf> {
         }
     }
     None
+}
+
+// ---------------------------------------------------------------------------
+// Out-of-sandbox mount listener
+//
+// On a bwrapped Steam (e.g. NixOS's FHS build) the game — and the
+// twwh3-run shim launched with it — run inside a bubblewrap sandbox with
+// PR_SET_NO_NEW_PRIVS, which neuters setuid fusermount3, so the overlay
+// can't be mounted from in there. But a mount created on the host after
+// the sandbox starts propagates into it (bwrap mounts are rslave of the
+// host). So the TUI, which runs outside the sandbox, does the mount on
+// twwh3-run's behalf: twwh3-run drops a request file in the shared cache
+// dir, this listener performs the mount, and the shim sees data/ become a
+// mountpoint from inside. The cache dir is known to be shared into the
+// sandbox — twwh3-run already writes its log there.
+
+fn cache_dir() -> PathBuf {
+    env::var("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| home().join(".cache"))
+}
+
+fn mount_request_file() -> PathBuf {
+    cache_dir().join("twwh3-mount-request")
+}
+
+fn unmount_request_file() -> PathBuf {
+    cache_dir().join("twwh3-unmount-request")
+}
+
+/// Advertises that a TUI listener is live, so twwh3-run doesn't wait on a
+/// request no one will service when the TUI is closed.
+fn mount_listener_marker() -> PathBuf {
+    cache_dir().join("twwh3-mount-listener")
+}
+
+/// Mount the staging overlay onto the game's data/ dir (host side). Only
+/// ever targets the game's own data/, and clears any stale overlay first.
+fn overlay_mount(data: &Path) -> bool {
+    match game_install_dir() {
+        Some(g) if g.join("data") == data => {}
+        _ => return false,
+    }
+    if overlay_mounted(data) {
+        overlay_unmount(data);
+    }
+    let Some(fo) = find_fuse_overlayfs() else { return false };
+    Command::new(fo)
+        .arg("-o")
+        .arg(format!("lowerdir={}:{}", staging_dir().display(), data.display()))
+        .arg(data)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+fn overlay_unmount(data: &Path) -> bool {
+    if !overlay_mounted(data) {
+        return true;
+    }
+    Command::new("fusermount3")
+        .args(["-u"])
+        .arg(data)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Spawn the background thread that services twwh3-run's mount/unmount
+/// requests, and drop the marker advertising it. Requests are tiny files
+/// holding the target data/ path.
+fn start_mount_listener() {
+    let _ = fs::create_dir_all(cache_dir());
+    let _ = fs::remove_file(mount_request_file());
+    let _ = fs::remove_file(unmount_request_file());
+    let _ = fs::write(mount_listener_marker(), std::process::id().to_string());
+    thread::spawn(|| loop {
+        if let Ok(data) = fs::read_to_string(mount_request_file()) {
+            let _ = fs::remove_file(mount_request_file());
+            let data = data.trim();
+            if !data.is_empty() {
+                overlay_mount(Path::new(data));
+            }
+        }
+        if let Ok(data) = fs::read_to_string(unmount_request_file()) {
+            let _ = fs::remove_file(unmount_request_file());
+            let data = data.trim();
+            if !data.is_empty() {
+                overlay_unmount(Path::new(data));
+            }
+        }
+        thread::sleep(Duration::from_millis(150));
+    });
+}
+
+/// Retract the listener marker and clear pending requests on shutdown.
+/// Does not unmount: a game launched from this session may still be
+/// running; a leaked overlay is cleared by the next mount instead.
+fn stop_mount_listener() {
+    let _ = fs::remove_file(mount_listener_marker());
+    let _ = fs::remove_file(mount_request_file());
+    let _ = fs::remove_file(unmount_request_file());
 }
 
 /// What `o` opens directories with: the open_with setting if given,
@@ -2850,7 +2959,10 @@ fn usage() {
            twwh3-run then merges the staging folder into the game's data/\n  \
            with fuse-overlayfs for the duration of the run (movie packs\n  \
            work; game files stay pristine). Without fuse-overlayfs it\n  \
-           falls back to plain working-directory loading automatically.\n\n\
+           falls back to plain working-directory loading automatically.\n  \
+           On a sandboxed (bwrap) Steam, twwh3-run can't mount the overlay\n  \
+           itself; while the TUI is open it services the mount from outside\n  \
+           the sandbox (launch with L, or keep twwh3-mods running).\n\n\
          Portable bundles:\n  \
            `export <profile>` writes <profile>.twwh3bundle.tar containing the\n  \
            profile and every pinned pack from the vault (in the TUI, press e\n  \
@@ -3016,9 +3128,14 @@ fn main() -> Result<()> {
     };
     let mut app = App::load(moddata_path(), picker)?;
 
+    // Service overlay mount requests from twwh3-run (which can't mount
+    // itself when the game runs inside Steam's bwrap sandbox).
+    start_mount_listener();
+
     let mut terminal = ratatui::init();
     let res = run(&mut terminal, &mut app);
     ratatui::restore();
+    stop_mount_listener();
     // Don't leave a preview overlay mounted behind us.
     if app.preview_mounted {
         if let Some(game) = game_install_dir() {

@@ -93,31 +93,61 @@ STAGING="${STAGING:-$DATA_DIR/staging}"
 OVERLAY="${TWWH3_OVERLAY:-$(cfg overlay)}"
 OVERLAY="${OVERLAY:-on}"
 
-mounted=""
+# Shared with twwh3-mods (this dir is visible inside Steam's sandbox — the
+# log above already lives here). When we can't mount the overlay ourselves
+# (a bwrapped Steam sets no_new_privs, which neuters setuid fusermount3),
+# we ask a twwh3-mods listener running outside the sandbox to do it; its
+# host-side mount propagates back in here.
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}"
+MOUNT_REQ="$CACHE_DIR/twwh3-mount-request"
+UNMOUNT_REQ="$CACHE_DIR/twwh3-unmount-request"
+LISTENER_MARKER="$CACHE_DIR/twwh3-mount-listener"
+
+# Ask the listener to mount, then wait for data/ to become a mountpoint
+# (the host mount propagates into this sandbox). 0 on success.
+mount_via_manager() {
+  [ -f "$LISTENER_MARKER" ] || return 1
+  command -v mountpoint >/dev/null || return 1
+  printf '%s\n' "$data" >"$MOUNT_REQ" 2>/dev/null || return 1
+  local n=0
+  while [ "$n" -lt 50 ]; do
+    mountpoint -q "$data" 2>/dev/null && return 0
+    sleep 0.1
+    n=$((n + 1))
+  done
+  return 1
+}
+unmount_via_manager() { printf '%s\n' "$data" >"$UNMOUNT_REQ" 2>/dev/null || true; }
+
+mounted=""          # "" | direct | manager
 modlist="used_mods.txt"
 data="$PWD/data"
 if [ -n "$gamedir" ] && [ -d "$data" ]; then
-  # Unmount a stale overlay left behind by a crashed previous run.
+  # Clear a stale overlay left behind by a crashed previous run.
   if command -v mountpoint >/dev/null && mountpoint -q "$data"; then
-    fusermount3 -u "$data" 2>/dev/null || true
-    log "unmounted stale overlay on $data"
+    fusermount3 -u "$data" 2>/dev/null || unmount_via_manager
+    log "cleared stale overlay on $data"
   fi
   if [ "$OVERLAY" != "off" ] && [ -d "$STAGING" ]; then
-    if ! command -v fuse-overlayfs >/dev/null; then
-      log "fuse-overlayfs not installed; loading mods from the staging folder instead"
-    elif fuse-overlayfs -o "lowerdir=$STAGING:$data" "$data" 2>>"$LOG_FILE"; then
-      mounted=1
-      # Unmount even if this script is killed rather than exiting normally.
+    if command -v fuse-overlayfs >/dev/null \
+       && fuse-overlayfs -o "lowerdir=$STAGING:$data" "$data" 2>>"$LOG_FILE"; then
+      # Direct mount (works on a non-sandboxed Steam).
+      mounted=direct
       trap 'fusermount3 -u "$data" 2>/dev/null || true' EXIT
-      log "overlay mounted: $STAGING merged into $data"
-      # With the packs visible in data/, loading them from the staging
-      # working directory as well would present every pack twice and
-      # confuse save-game mod matching — use the mod-lines-only list.
-      if [ -f used_mods_overlay.txt ]; then
-        modlist="used_mods_overlay.txt"
-      fi
+      log "overlay mounted directly: $STAGING merged into $data"
+    elif mount_via_manager; then
+      # Sandboxed Steam: the twwh3-mods listener mounted it on the host.
+      mounted=manager
+      trap 'unmount_via_manager' EXIT
+      log "overlay mounted via twwh3-mods listener: $STAGING merged into $data"
     else
-      log "overlay mount failed; loading mods from the staging folder instead"
+      log "no overlay (direct mount denied and no listener); loading mods from the staging folder"
+    fi
+    # With the packs visible in data/, loading them from the staging
+    # working directory as well would present every pack twice and confuse
+    # save-game mod matching — use the mod-lines-only list.
+    if [ -n "$mounted" ] && [ -f used_mods_overlay.txt ]; then
+      modlist="used_mods_overlay.txt"
     fi
   fi
 fi
@@ -126,12 +156,19 @@ log "cwd=$PWD run: ${args[*]} $modlist;"
 rc=0
 "${args[@]}" "$modlist;" || rc=$?
 
-if [ -n "$mounted" ]; then
-  if fusermount3 -u "$data" 2>>"$LOG_FILE"; then
-    log "overlay unmounted"
-  else
-    log "warning: could not unmount overlay on $data"
-  fi
-  trap - EXIT
-fi
+case "$mounted" in
+  direct)
+    if fusermount3 -u "$data" 2>>"$LOG_FILE"; then
+      log "overlay unmounted"
+    else
+      log "warning: could not unmount overlay on $data"
+    fi
+    trap - EXIT
+    ;;
+  manager)
+    unmount_via_manager
+    log "asked twwh3-mods listener to unmount overlay on $data"
+    trap - EXIT
+    ;;
+esac
 exit "$rc"

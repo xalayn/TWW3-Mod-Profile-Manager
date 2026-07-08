@@ -45,6 +45,13 @@ made in either show up in both.
   stays clean. If `fuse-overlayfs` isn't installed, it automatically
   falls back to working-directory loading (everything but movie packs
   works the same).
+- **Sandboxed Steam (bwrap)** — on setups where Steam runs games inside a
+  bubblewrap sandbox (e.g. NixOS's FHS build), `twwh3-run` can't mount the
+  overlay itself (the sandbox's `no_new_privs` disables setuid
+  `fusermount3`). When the TUI is open it acts as a listener and performs
+  the mount from *outside* the sandbox — it propagates back in — so the
+  overlay still works. Launch with `L` (or keep `twwh3-mods` running) to
+  use it; otherwise it falls back to working-directory loading.
 - **Mod thumbnails** in terminals with image support (kitty, sixel,
   iTerm2 protocol; half-blocks elsewhere).
 
