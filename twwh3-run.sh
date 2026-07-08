@@ -119,6 +119,13 @@ mount_via_manager() {
 }
 unmount_via_manager() { printf '%s\n' "$data" >"$UNMOUNT_REQ" 2>/dev/null || true; }
 
+# Record the definitive overlay decision (epoch + message) so twwh3-mods
+# can show, after you press L, exactly which method the game launched with.
+STATUS_FILE="$CACHE_DIR/twwh3-overlay-status"
+overlay_report() {
+  printf '%s\t%s\n' "$(date +%s)" "$1" >"$STATUS_FILE" 2>/dev/null || true
+}
+
 mounted=""          # "" | direct | manager
 modlist="used_mods.txt"
 data="$PWD/data"
@@ -150,6 +157,16 @@ if [ -n "$gamedir" ] && [ -d "$data" ]; then
       modlist="used_mods_overlay.txt"
     fi
   fi
+fi
+
+if [ "$OVERLAY" = "off" ]; then
+  overlay_report "overlay off - working-directory loading"
+elif [ "$mounted" = "direct" ]; then
+  overlay_report "overlay ON - mounted directly; game reads merged data/ (movie packs enabled)"
+elif [ "$mounted" = "manager" ]; then
+  overlay_report "overlay ON - mounted via twwh3-mods; game reads merged data/ (movie packs enabled)"
+else
+  overlay_report "overlay UNAVAILABLE - working-directory loading (mods load, movie packs won't)"
 fi
 
 log "cwd=$PWD run: ${args[*]} $modlist;"

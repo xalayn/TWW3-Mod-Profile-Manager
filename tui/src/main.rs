@@ -756,6 +756,12 @@ fn mount_listener_marker() -> PathBuf {
     cache_dir().join("twwh3-mount-listener")
 }
 
+/// twwh3-run records its definitive overlay decision here (epoch + text)
+/// so the TUI can report which method a launch actually used.
+fn overlay_status_file() -> PathBuf {
+    cache_dir().join("twwh3-overlay-status")
+}
+
 /// Mount the staging overlay onto the game's data/ dir (host side). Only
 /// ever targets the game's own data/, and clears any stale overlay first.
 fn overlay_mount(data: &Path) -> bool {
@@ -1004,6 +1010,9 @@ struct App {
     status_lines: Vec<StatusLine>,
     /// We mounted a data/ overlay preview (o) and must unmount it.
     preview_mounted: bool,
+    /// After L, watch twwh3-run's overlay-status file for a report newer
+    /// than this launch epoch, to show which method the game launched with.
+    overlay_watch_since: Option<u64>,
 }
 
 impl App {
@@ -1076,6 +1085,7 @@ impl App {
             rename_from: None,
             status_lines: Vec::new(),
             preview_mounted: false,
+            overlay_watch_since: None,
         };
         if !app.slots.is_empty() {
             app.prof_state.select(Some(0));
@@ -1889,21 +1899,30 @@ impl App {
                 } else {
                     String::new()
                 };
-                // Both mod-list files are written; twwh3-run decides at
-                // launch which the game reads (used_mods_overlay.txt if it
-                // mounts the overlay). twwh3-mods can't know that here, so
-                // don't claim a specific file — point at the log instead.
-                let overlay = setting("TWWH3_OVERLAY", "overlay").unwrap_or_else(|| "on".into());
-                let how = if overlay == "off" {
-                    "used_mods.txt (overlay off — working-directory loading)"
-                } else {
-                    "used_mods_overlay.txt if twwh3-run mounts the overlay, else used_mods.txt"
-                };
+                // twwh3-run decides the overlay method a moment later, when
+                // the game actually starts, and records it; watch for that
+                // report (newer than now) and show it when it lands.
+                self.overlay_watch_since = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .ok();
                 self.status = format!(
-                    "Launching via Steam: {mods} mods{pin_note} — game reads {how} (see ~/.cache/twwh3-run.log)"
+                    "Launching via Steam: {mods} mods{pin_note} — overlay result will appear here when the game starts"
                 );
             }
             Err(e) => self.status = format!("could not run steam: {e}"),
+        }
+    }
+
+    /// After L, surface twwh3-run's definitive overlay decision once it
+    /// records one newer than the launch. Called each UI tick.
+    fn poll_overlay_status(&mut self) {
+        let Some(since) = self.overlay_watch_since else { return };
+        let Ok(text) = fs::read_to_string(overlay_status_file()) else { return };
+        let Some((ts, msg)) = text.trim().split_once('\t') else { return };
+        if ts.parse::<u64>().is_ok_and(|t| t >= since) {
+            self.status = msg.to_string();
+            self.overlay_watch_since = None;
         }
     }
 
@@ -2726,7 +2745,14 @@ fn draw_name_input(f: &mut Frame, app: &mut App) {
 
 fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<()> {
     loop {
+        // Pick up twwh3-run's overlay report (written asynchronously after
+        // a launch) so it can be shown even without a keypress.
+        app.poll_overlay_status();
         terminal.draw(|f| draw(f, app))?;
+        // Poll rather than block so the overlay report surfaces promptly.
+        if !event::poll(Duration::from_millis(250))? {
+            continue;
+        }
         let Event::Key(key) = event::read()? else { continue };
         if key.kind != KeyEventKind::Press {
             continue;
