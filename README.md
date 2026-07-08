@@ -107,7 +107,12 @@ twwh3-mods --paths    # show every resolved path
 
 Keys: `tab`/`h`/`l` switch pane · `j`/`k` select · `space`/`enter`
 add/remove · `J`/`K` reorder · `p` profiles · `s` save · `S` status
-page · `L` launch · `q` quit.
+page · `o` open the merged `data/` view · `L` launch · `q` quit.
+
+`o` opens the game's `data/` folder in your file manager *as the game
+will see it*: if the overlay is up (game running) it opens the live
+merged view, otherwise it mounts a preview of the current load order
+first (press `o` again to unmount).
 
 The status page (`S`) is the first thing to check when something's off:
 it shows every resolved path, whether the Steam launch options and the

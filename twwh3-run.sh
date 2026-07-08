@@ -17,10 +17,12 @@
 # builds at launch, one per enabled mod) into the game's data/ directory
 # with a fuse-overlayfs mount for the duration of the run. The real data/
 # stays pristine, Steam's "verify integrity" never sees the mods, and pack
-# types that only load from data/ (movie packs) work. If fuse-overlayfs is
-# not installed (or `overlay = off` / TWWH3_OVERLAY=off is set), the game
-# falls back to loading mods from the staging folder via the add_working_directory
-# line in used_mods.txt — everything except movie packs works identically.
+# types that only load from data/ (movie packs) work. While the overlay is
+# up the game is given the mod-lines-only list (used_mods_overlay.txt) so
+# each pack is visible exactly once. If fuse-overlayfs is not installed
+# (or `overlay = off` / TWWH3_OVERLAY=off is set), the game falls back to
+# loading mods from the staging folder via the add_working_directory line
+# in used_mods.txt — everything except movie packs works identically.
 #
 # Steam's working directory is the launcher subfolder, but the game
 # resolves the mod-list argument relative to its working directory, so we
@@ -92,6 +94,7 @@ OVERLAY="${TWWH3_OVERLAY:-$(cfg overlay)}"
 OVERLAY="${OVERLAY:-on}"
 
 mounted=""
+modlist="used_mods.txt"
 data="$PWD/data"
 if [ -n "$gamedir" ] && [ -d "$data" ]; then
   # Unmount a stale overlay left behind by a crashed previous run.
@@ -107,15 +110,21 @@ if [ -n "$gamedir" ] && [ -d "$data" ]; then
       # Unmount even if this script is killed rather than exiting normally.
       trap 'fusermount3 -u "$data" 2>/dev/null || true' EXIT
       log "overlay mounted: $STAGING merged into $data"
+      # With the packs visible in data/, loading them from the staging
+      # working directory as well would present every pack twice and
+      # confuse save-game mod matching — use the mod-lines-only list.
+      if [ -f used_mods_overlay.txt ]; then
+        modlist="used_mods_overlay.txt"
+      fi
     else
       log "overlay mount failed; loading mods from the staging folder instead"
     fi
   fi
 fi
 
-log "cwd=$PWD run: ${args[*]} used_mods.txt;"
+log "cwd=$PWD run: ${args[*]} $modlist;"
 rc=0
-"${args[@]}" "used_mods.txt;" || rc=$?
+"${args[@]}" "$modlist;" || rc=$?
 
 if [ -n "$mounted" ]; then
   if fusermount3 -u "$data" 2>>"$LOG_FILE"; then

@@ -595,6 +595,64 @@ fn vault_stats() -> (usize, u64) {
     (versions, bytes)
 }
 
+/// Whether something FUSE-y is mounted on `dir` (the game overlay, or
+/// our own preview mount). /proc/mounts escapes spaces as \040.
+fn overlay_mounted(dir: &Path) -> bool {
+    let Ok(text) = fs::read_to_string("/proc/mounts") else {
+        return false;
+    };
+    let target = dir.to_string_lossy().replace(' ', "\\040");
+    text.lines().any(|l| {
+        let mut f = l.split_whitespace();
+        f.next(); // source
+        f.next() == Some(&target) && f.next().is_some_and(|t| t.contains("fuse"))
+    })
+}
+
+/// fuse-overlayfs from PATH, or the copy the Nix-wrapped twwh3-run
+/// script carries on its own PATH line.
+fn find_fuse_overlayfs() -> Option<PathBuf> {
+    if let Some(p) = on_path("fuse-overlayfs") {
+        return Some(p);
+    }
+    let script = fs::read_to_string(on_path("twwh3-run")?).ok()?;
+    for piece in script.split(|c: char| c == '"' || c == ':' || c.is_whitespace()) {
+        if piece.starts_with('/') && piece.contains("fuse-overlayfs") {
+            let cand = Path::new(piece).join("fuse-overlayfs");
+            if cand.is_file() {
+                return Some(cand);
+            }
+        }
+    }
+    None
+}
+
+/// What `o` opens directories with: the open_with setting if given,
+/// else xdg-open. If xdg-open sends folders to the wrong application on
+/// your system, set open_with (or fix the inode/directory MIME handler).
+fn dir_opener() -> Option<PathBuf> {
+    if let Some(cmd) = setting("TWWH3_OPEN", "open_with") {
+        let p = expand_path(&cmd);
+        return if p.is_absolute() { Some(p) } else { on_path(&cmd) };
+    }
+    on_path("xdg-open")
+}
+
+/// Open a directory in the user's file manager, detached from the TUI.
+fn open_dir(dir: &Path) -> bool {
+    let Some(opener) = dir_opener() else { return false };
+    Command::new(opener)
+        .arg(dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .is_ok()
+}
+
+/// Status-line hint when no directory opener could be found.
+const OPENER_HINT: &str = "no file manager found — set open_with in ~/.config/twwh3-mods/config";
+
 /// Shorten a path for display by replacing $HOME with ~.
 fn tilde(p: &Path) -> String {
     let s = p.display().to_string();
@@ -702,6 +760,8 @@ struct App {
     input: String,
     /// Rows of the status page, computed when it is opened (S).
     status_lines: Vec<StatusLine>,
+    /// We mounted a data/ overlay preview (o) and must unmount it.
+    preview_mounted: bool,
 }
 
 impl App {
@@ -772,6 +832,7 @@ impl App {
             confirm_delete: false,
             input: String::new(),
             status_lines: Vec::new(),
+            preview_mounted: false,
         };
         if !app.slots.is_empty() {
             app.prof_state.select(Some(0));
@@ -926,6 +987,24 @@ impl App {
             } else {
                 StatusLine::new("/dev/fuse", "missing — kernel FUSE unavailable", Some(false))
             });
+            if let Some(g) = &game {
+                let merged = overlay_mounted(&g.join("data"));
+                v.push(StatusLine::new(
+                    "data view",
+                    if self.preview_mounted {
+                        "merged — preview mounted (o to unmount)"
+                    } else if merged {
+                        "merged — overlay mounted now"
+                    } else {
+                        "vanilla until launch (o to preview)"
+                    },
+                    None,
+                ));
+            }
+        }
+        match dir_opener() {
+            Some(p) => v.push(StatusLine::new("o opens with", tilde(&p), Some(true))),
+            None => v.push(StatusLine::new("o opens with", OPENER_HINT, Some(false))),
         }
 
         v.push(StatusLine::section("Mods"));
@@ -1413,13 +1492,25 @@ impl App {
         }
         let staging = staging_dir();
         rebuild_staging(&staging, &packs)?;
+        // Two lists: used_mods.txt loads packs from the staging folder
+        // (no overlay needed); used_mods_overlay.txt has mod lines only,
+        // for when twwh3-run has merged staging into data/. Loading from
+        // both places at once would present every pack twice and confuse
+        // the game's save-game mod matching, so the shim picks exactly
+        // one depending on whether the mount succeeded.
         let mut out = format!("add_working_directory \"{}\";\n", unix_to_win(&staging));
+        let mut overlay_out = String::new();
         for l in &mod_lines {
             out.push_str(l);
             out.push('\n');
+            overlay_out.push_str(l);
+            overlay_out.push('\n');
         }
         fs::write(game_dir.join("used_mods.txt"), out)
             .with_context(|| format!("could not write used_mods.txt in {}", game_dir.display()))?;
+        fs::write(game_dir.join("used_mods_overlay.txt"), overlay_out).with_context(|| {
+            format!("could not write used_mods_overlay.txt in {}", game_dir.display())
+        })?;
         Ok((mod_lines.len(), pinned))
     }
 
@@ -1437,6 +1528,9 @@ impl App {
                 return;
             }
         };
+        // A preview mount is now the shim's problem: it unmounts stale
+        // overlays before mounting its own.
+        self.preview_mounted = false;
         match Command::new("steam")
             .args(["-applaunch", &APPID.to_string()])
             .stdin(Stdio::null())
@@ -1455,6 +1549,90 @@ impl App {
                 );
             }
             Err(e) => self.status = format!("could not run steam: {e}"),
+        }
+    }
+
+    /// `o`: open the game's data/ folder as the game will see it. If an
+    /// overlay is already mounted (game running), just open it; otherwise
+    /// mount a preview of the current load order first. Pressing o again
+    /// unmounts a preview we mounted.
+    fn toggle_data_view(&mut self) {
+        let Some(game) = game_install_dir() else {
+            self.status = "Data view: game install dir not found".into();
+            return;
+        };
+        let data = game.join("data");
+        if self.preview_mounted {
+            let ok = Command::new("fusermount3")
+                .args(["-u"])
+                .arg(&data)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            self.preview_mounted = false;
+            self.status = if ok || !overlay_mounted(&data) {
+                "Data preview unmounted".into()
+            } else {
+                format!("Could not unmount the preview on {}", data.display())
+            };
+            return;
+        }
+        if overlay_mounted(&data) {
+            self.status = if open_dir(&data) {
+                format!(
+                    "Opened merged data/ — overlay already mounted; if the game isn't running, \
+                     `fusermount3 -u \"{}\"` removes it",
+                    tilde(&data)
+                )
+            } else {
+                format!("Data view: {OPENER_HINT}")
+            };
+            return;
+        }
+        // Refresh staging (and both mod lists) so the preview shows
+        // exactly what a launch would.
+        if let Err(e) = self.write_used_mods() {
+            self.status = format!("Data view failed: {e:#}");
+            return;
+        }
+        let Some(fo) = find_fuse_overlayfs() else {
+            self.status = if open_dir(&data) {
+                "fuse-overlayfs not found — opening plain data/ (no merged preview)".into()
+            } else {
+                format!("Data view: {OPENER_HINT}")
+            };
+            return;
+        };
+        let mounted = Command::new(fo)
+            .arg("-o")
+            .arg(format!(
+                "lowerdir={}:{}",
+                staging_dir().display(),
+                data.display()
+            ))
+            .arg(&data)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if mounted {
+            self.preview_mounted = true;
+            self.status = if open_dir(&data) {
+                "Mounted merged data/ preview — press o again to unmount before playing".into()
+            } else {
+                format!("Preview mounted ({OPENER_HINT}); press o again to unmount")
+            };
+        } else {
+            self.status = if open_dir(&data) {
+                "Overlay preview mount failed — opening plain data/".into()
+            } else {
+                format!("Overlay preview mount failed; {OPENER_HINT}")
+            };
         }
     }
 
@@ -1552,7 +1730,7 @@ fn draw(f: &mut Frame, app: &mut App) {
     } else {
         let keys = match app.mode {
             Mode::Browse => {
-                " tab pane · j/k select · space add/remove · J/K reorder · p profiles · s save · S status · L launch · q quit"
+                " tab pane · j/k select · space add/remove · J/K reorder · p profiles · s save · S status · o data · L launch · q quit"
             }
             Mode::Profiles => " enter apply · n new · d delete · esc close",
             Mode::NameInput => " enter save · esc cancel",
@@ -2010,6 +2188,7 @@ fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<()> {
                         app.status_lines = app.build_status();
                         app.mode = Mode::Status;
                     }
+                    KeyCode::Char('o') => app.toggle_data_view(),
                     KeyCode::Char('L') => app.launch(),
                     _ => {}
                 }
@@ -2107,6 +2286,8 @@ fn usage() {
            space / enter    add to or remove from the load order\n  \
            J/K              reorder within the load order\n  \
            p                profiles (enter apply, n new, d delete)\n  \
+           o                open the game's data/ folder as the game will\n                    \
+           see it (mounts a merged preview; o again unmounts)\n  \
            s save     S status page     L launch     q quit\n\n\
          Launching (one-time setup):\n  \
            L / --launch write used_mods.txt into the game folder and run\n  \
@@ -2147,12 +2328,13 @@ fn usage() {
            workshop    Workshop content dir      (default: derived from steam_root)\n  \
            game_dir    Game install dir          (default: derived from steam_root)\n  \
            images      auto (default) | halfblocks | off\n  \
-           overlay     on (default) | off — twwh3-run's data/ overlay\n\n  \
+           overlay     on (default) | off — twwh3-run's data/ overlay\n  \
+           open_with   command `o` opens folders with (default: xdg-open)\n\n  \
            Each key also has an env var that overrides it: STEAM_ROOT,\n  \
            TWWH3_DATA, TWWH3_MODLISTS, TWWH3_VAULT, TWWH3_LOCAL,\n  \
            TWWH3_STAGING, TWWH3_MODDATA, TWWH3_WORKSHOP, TWWH3_GAME,\n  \
-           TWWH3_IMAGES, TWWH3_OVERLAY. `twwh3-mods --paths` shows the\n  \
-           resolved values."
+           TWWH3_IMAGES, TWWH3_OVERLAY, TWWH3_OPEN. `twwh3-mods --paths`\n  \
+           shows the resolved values."
     );
 }
 
@@ -2249,5 +2431,17 @@ fn main() -> Result<()> {
     let mut terminal = ratatui::init();
     let res = run(&mut terminal, &mut app);
     ratatui::restore();
+    // Don't leave a preview overlay mounted behind us.
+    if app.preview_mounted {
+        if let Some(game) = game_install_dir() {
+            let _ = Command::new("fusermount3")
+                .args(["-u"])
+                .arg(game.join("data"))
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+    }
     res
 }

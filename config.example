@@ -40,3 +40,10 @@
 # for the duration of a run (needed for movie packs; keeps the real game
 # files pristine). Set to off to always use working-directory loading.
 #overlay = on
+
+# What the TUI's `o` key opens folders with (default: xdg-open). Set
+# this if xdg-open sends folders to the wrong application — that means
+# your system has no inode/directory MIME handler configured, which you
+# can also fix globally with e.g.:
+#   xdg-mime default org.gnome.Nautilus.desktop inode/directory
+#open_with = nautilus
