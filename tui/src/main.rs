@@ -1709,7 +1709,9 @@ impl App {
     }
 
     /// Pin the selected mod to the highlighted version (storing it first
-    /// if needed) and return to Browse.
+    /// if needed) and return to Browse. A pin only lives in the profile,
+    /// so it only takes effect — and only marks the profile modified — for
+    /// a mod that's actually in the load order.
     fn pick_version(&mut self) {
         self.mode = Mode::Browse;
         let (Some(idx), Some(sel)) = (self.version_mod, self.version_state.selected()) else {
@@ -1720,6 +1722,10 @@ impl App {
         let Some(sid) = self.pool[idx].steam_id.clone() else { return };
         let id = self.pool[idx].id().to_string();
         let name = self.pool[idx].name().to_string();
+        if !self.slots.iter().any(|s| s.idx == Some(idx)) {
+            self.status = format!("'{name}' isn't in the load order — add it first to pin a version");
+            return;
+        }
         // Make sure the chosen version is on disk so it resolves at launch.
         if !stored {
             let dir = self.pool[idx].dir.clone();
