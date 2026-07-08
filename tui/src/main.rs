@@ -34,6 +34,7 @@ use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
+use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
@@ -140,6 +141,13 @@ fn local_mods_dir() -> PathBuf {
 /// Local store of past mod versions: vault/<steam_id>/<manifest>/<pack>.
 fn vault_dir() -> PathBuf {
     path_setting("TWWH3_VAULT", "vault").unwrap_or_else(|| data_dir().join("vault"))
+}
+
+/// Staging folder: the load order materialized as one symlink per pack,
+/// each pointing at the exact file the game should read (workshop copy,
+/// vaulted pin, or local mod). Rebuilt on every launch.
+fn staging_dir() -> PathBuf {
+    path_setting("TWWH3_STAGING", "staging").unwrap_or_else(|| data_dir().join("staging"))
 }
 
 /// Convert a wine path like "Z:/home/x/y.pack" to a unix path.
@@ -492,6 +500,33 @@ fn vault_pack(entry: &ModEntry, manifest: &str) -> Result<bool> {
     Ok(true)
 }
 
+/// Rebuild the staging folder so it contains exactly one link per pack
+/// in `packs`, in place of whatever it held before. Only symlinks are
+/// ever removed; a regular file squatting on a pack's name is an error
+/// rather than something to silently delete.
+fn rebuild_staging(staging: &Path, packs: &[PathBuf]) -> Result<()> {
+    fs::create_dir_all(staging)
+        .with_context(|| format!("could not create staging dir {}", staging.display()))?;
+    for entry in fs::read_dir(staging)? {
+        let p = entry?.path();
+        if p.symlink_metadata()?.file_type().is_symlink() {
+            fs::remove_file(&p)?;
+        }
+    }
+    for src in packs {
+        let Some(fname) = src.file_name() else { continue };
+        let dst = staging.join(fname);
+        symlink(src, &dst).with_context(|| {
+            format!(
+                "could not link {} into staging ({}) — remove any real file by that name",
+                fname.to_string_lossy(),
+                staging.display()
+            )
+        })?;
+    }
+    Ok(())
+}
+
 /// Where the vaulted copy of a specific mod version lives, if it exists.
 fn vaulted_pack(entry: &ModEntry, manifest: &str) -> Option<PathBuf> {
     let sid = entry.steam_id.as_ref()?;
@@ -513,6 +548,91 @@ fn human_size(b: u64) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Status page checks
+
+/// Where `bin` resolves on this shell's PATH, if anywhere. (Steam may
+/// see a different PATH, so this is a best-effort signal.)
+fn on_path(bin: &str) -> Option<PathBuf> {
+    let path = env::var_os("PATH")?;
+    env::split_paths(&path)
+        .map(|d| d.join(bin))
+        .find(|p| p.is_file())
+}
+
+/// Whether any Steam user's launch options mention twwh3-run. Steam
+/// keeps launch options in userdata/<id>/config/localconfig.vdf.
+/// None = could not read any config (unknown).
+fn launch_options_use_shim() -> Option<bool> {
+    let rd = fs::read_dir(steam_root().join("userdata")).ok()?;
+    let mut seen_any = false;
+    for entry in rd.flatten() {
+        let cfg = entry.path().join("config/localconfig.vdf");
+        if let Ok(text) = fs::read_to_string(cfg) {
+            seen_any = true;
+            if text.contains("twwh3-run") {
+                return Some(true);
+            }
+        }
+    }
+    seen_any.then_some(false)
+}
+
+/// (vaulted versions, total bytes) across the whole vault.
+fn vault_stats() -> (usize, u64) {
+    let mut versions = 0usize;
+    let mut bytes = 0u64;
+    for id_dir in fs::read_dir(vault_dir()).into_iter().flatten().flatten() {
+        for man_dir in fs::read_dir(id_dir.path()).into_iter().flatten().flatten() {
+            if !man_dir.path().is_dir() {
+                continue;
+            }
+            versions += 1;
+            for f in fs::read_dir(man_dir.path()).into_iter().flatten().flatten() {
+                bytes += f.metadata().map(|m| m.len()).unwrap_or(0);
+            }
+        }
+    }
+    (versions, bytes)
+}
+
+/// Shorten a path for display by replacing $HOME with ~.
+fn tilde(p: &Path) -> String {
+    let s = p.display().to_string();
+    match env::var("HOME") {
+        Ok(h) if !h.is_empty() && s.starts_with(&h) => s.replacen(&h, "~", 1),
+        _ => s,
+    }
+}
+
+/// One row of the status page. `ok` drives the colour: true = green,
+/// false = red, None = informational. An empty value marks a section
+/// header.
+struct StatusLine {
+    label: String,
+    value: String,
+    ok: Option<bool>,
+}
+
+impl StatusLine {
+    fn section(label: &str) -> Self {
+        Self { label: label.into(), value: String::new(), ok: None }
+    }
+    fn new(label: &str, value: impl Into<String>, ok: Option<bool>) -> Self {
+        Self { label: label.into(), value: value.into(), ok }
+    }
+}
+
+/// A path row: green when it exists, `missing_note` (with `missing_ok`
+/// severity) when it doesn't.
+fn path_line(label: &str, p: &Path, missing_note: &str, missing_ok: Option<bool>) -> StatusLine {
+    if p.exists() {
+        StatusLine::new(label, tilde(p), Some(true))
+    } else {
+        StatusLine::new(label, format!("{} {}", tilde(p), missing_note), missing_ok)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // App state
 
 #[derive(PartialEq)]
@@ -520,6 +640,7 @@ enum Mode {
     Browse,
     Profiles,
     NameInput,
+    Status,
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -579,6 +700,8 @@ struct App {
     preview: Vec<PreviewLine>,
     confirm_delete: bool,
     input: String,
+    /// Rows of the status page, computed when it is opened (S).
+    status_lines: Vec<StatusLine>,
 }
 
 impl App {
@@ -648,6 +771,7 @@ impl App {
             preview: Vec::new(),
             confirm_delete: false,
             input: String::new(),
+            status_lines: Vec::new(),
         };
         if !app.slots.is_empty() {
             app.prof_state.select(Some(0));
@@ -732,6 +856,123 @@ impl App {
             "Since '{name}' was saved: {} — L launches with pinned versions where vaulted",
             parts.join("; ")
         ))
+    }
+
+    /// Gather everything for the status page (S): resolved paths, the
+    /// launch/overlay plumbing, and the current mod/profile state.
+    fn build_status(&self) -> Vec<StatusLine> {
+        let mut v = Vec::new();
+
+        v.push(StatusLine::section("Paths"));
+        v.push(path_line("config file", &config_file(), "(not present — defaults in use)", None));
+        v.push(path_line("launcher data", &self.path, "(missing — run the game once)", Some(false)));
+        v.push(path_line("workshop", &workshop_dir(), "(missing — no Workshop mods downloaded?)", Some(false)));
+        let game = game_install_dir();
+        match &game {
+            Some(d) => v.push(StatusLine::new("game", tilde(d), Some(true))),
+            None => v.push(StatusLine::new("game", "not found — set game_dir in the config", Some(false))),
+        }
+        v.push(path_line("profiles", &modlists_dir(), "(created on first save)", None));
+        v.push(path_line("vault", &vault_dir(), "(created on first save)", None));
+        v.push(path_line("local mods", &local_mods_dir(), "(create it and drop .pack files in)", None));
+        v.push(path_line("staging", &staging_dir(), "(created on first launch)", None));
+        if let Some(g) = &game {
+            v.push(path_line("used_mods.txt", &g.join("used_mods.txt"), "(written when you press L)", None));
+        }
+
+        v.push(StatusLine::section("Launch"));
+        match on_path("twwh3-run") {
+            Some(p) => v.push(StatusLine::new("twwh3-run", tilde(&p), Some(true))),
+            None => v.push(StatusLine::new("twwh3-run", "not found on PATH", Some(false))),
+        }
+        match launch_options_use_shim() {
+            Some(true) => v.push(StatusLine::new("launch options", "twwh3-run is set up in Steam", Some(true))),
+            Some(false) => v.push(StatusLine::new(
+                "launch options",
+                "twwh3-run not set — Steam opens the CA launcher (no pinning/overlay)",
+                Some(false),
+            )),
+            None => v.push(StatusLine::new("launch options", "could not read Steam userdata", None)),
+        }
+        let overlay = setting("TWWH3_OVERLAY", "overlay").unwrap_or_else(|| "on".into());
+        if overlay == "off" {
+            v.push(StatusLine::new("overlay", "off — working-directory loading (movie packs won't load)", None));
+        } else {
+            v.push(StatusLine::new("overlay", "on", Some(true)));
+            match on_path("fuse-overlayfs") {
+                Some(p) => v.push(StatusLine::new("fuse-overlayfs", tilde(&p), Some(true))),
+                None => {
+                    // The Nix-wrapped twwh3-run carries its own copy.
+                    let bundled = on_path("twwh3-run")
+                        .and_then(|p| fs::read_to_string(p).ok())
+                        .is_some_and(|t| t.contains("fuse-overlayfs"));
+                    v.push(if bundled {
+                        StatusLine::new("fuse-overlayfs", "bundled with twwh3-run", Some(true))
+                    } else {
+                        StatusLine::new(
+                            "fuse-overlayfs",
+                            "not found — mods still load, movie packs won't (install fuse-overlayfs)",
+                            Some(false),
+                        )
+                    });
+                }
+            }
+            match on_path("fusermount3") {
+                Some(p) => v.push(StatusLine::new("fusermount3", tilde(&p), Some(true))),
+                None => v.push(StatusLine::new("fusermount3", "not found (install fuse3)", Some(false))),
+            }
+            v.push(if Path::new("/dev/fuse").exists() {
+                StatusLine::new("/dev/fuse", "present", Some(true))
+            } else {
+                StatusLine::new("/dev/fuse", "missing — kernel FUSE unavailable", Some(false))
+            });
+        }
+
+        v.push(StatusLine::section("Mods"));
+        v.push(StatusLine::new(
+            "game build",
+            self.game_buildid.clone().unwrap_or_else(|| "unknown".into()),
+            None,
+        ));
+        v.push(StatusLine::new(
+            "profile",
+            self.current_profile.clone().unwrap_or_else(|| "(unsaved)".into()),
+            None,
+        ));
+        let missing = self.slots.iter().filter(|s| self.slot_missing(s)).count();
+        let updated = self.slots.iter().filter(|s| self.slot_updated(s)).count();
+        let mut lo = format!("{} mods", self.slots.len());
+        if missing > 0 {
+            lo.push_str(&format!(", {missing} missing"));
+        }
+        if updated > 0 {
+            lo.push_str(&format!(", {updated} updated past their pin (vault used at launch)"));
+        }
+        v.push(StatusLine::new("load order", lo, Some(missing == 0)));
+        if self.dirty {
+            v.push(StatusLine::new("unsaved changes", "yes — press s to save", Some(false)));
+        }
+        let installed = self.pool.iter().filter(|m| !m.missing).count();
+        let local = self.pool.iter().filter(|m| m.local).count();
+        let new = self.pool.iter().filter(|m| m.discovered).count();
+        let mut pool = format!("{installed} installed");
+        if local > 0 {
+            pool.push_str(&format!(", {local} local"));
+        }
+        if new > 0 {
+            pool.push_str(&format!(", {new} new"));
+        }
+        v.push(StatusLine::new("mod pool", pool, None));
+        let (versions, bytes) = vault_stats();
+        v.push(StatusLine::new(
+            "vault",
+            format!("{versions} pack versions, {}", human_size(bytes)),
+            None,
+        ));
+        let images = setting("TWWH3_IMAGES", "images").unwrap_or_else(|| "auto".into());
+        let active = if self.picker.is_some() { "" } else { " (inactive)" };
+        v.push(StatusLine::new("thumbnails", format!("{images}{active}"), None));
+        v
     }
 
     /// Change the current profile and persist the choice.
@@ -1131,14 +1372,19 @@ impl App {
 
     // -- launching ----------------------------------------------------------
 
-    /// Generate used_mods.txt in the game dir from the load order. Mods
-    /// whose workshop copy was updated past the profile's pin use the
-    /// vaulted (pinned) version when it exists. Returns (mods, pinned).
+    /// Generate used_mods.txt in the game dir from the load order. Each
+    /// mod is resolved to the exact pack file it should load — the
+    /// vaulted (pinned) version when Steam has updated past the
+    /// profile's pin, the live copy otherwise — and materialized as a
+    /// symlink in the staging folder, which twwh3-run overlays onto the
+    /// game's data/ (or, without fuse-overlayfs, becomes the game's mod
+    /// working directory). `ls -l` on staging shows the full resolution.
+    /// Returns (mods, pinned).
     fn write_used_mods(&self) -> Result<(usize, usize)> {
         let game_dir = game_install_dir().context(
             "could not find the game install dir (steamapps/common/Total War WARHAMMER III)",
         )?;
-        let mut dirs: Vec<PathBuf> = Vec::new();
+        let mut packs: Vec<PathBuf> = Vec::new();
         let mut mod_lines: Vec<String> = Vec::new();
         let mut pinned = 0usize;
         for s in &self.slots {
@@ -1158,17 +1404,16 @@ impl App {
             } else {
                 live.clone()
             };
-            let Some(dir) = path.parent() else { continue };
             let Some(fname) = path.file_name().and_then(|f| f.to_str()) else { continue };
-            if !dirs.iter().any(|d| d == dir) {
-                dirs.push(dir.to_path_buf());
+            if packs.iter().any(|p| p.file_name() == path.file_name()) {
+                continue;
             }
             mod_lines.push(format!("mod \"{fname}\";"));
+            packs.push(path);
         }
-        let mut out = String::new();
-        for d in &dirs {
-            out.push_str(&format!("add_working_directory \"{}\";\n", unix_to_win(d)));
-        }
+        let staging = staging_dir();
+        rebuild_staging(&staging, &packs)?;
+        let mut out = format!("add_working_directory \"{}\";\n", unix_to_win(&staging));
         for l in &mod_lines {
             out.push_str(l);
             out.push('\n');
@@ -1307,10 +1552,11 @@ fn draw(f: &mut Frame, app: &mut App) {
     } else {
         let keys = match app.mode {
             Mode::Browse => {
-                " tab pane · j/k select · space add/remove · J/K reorder · p profiles · s save · q quit"
+                " tab pane · j/k select · space add/remove · J/K reorder · p profiles · s save · S status · L launch · q quit"
             }
             Mode::Profiles => " enter apply · n new · d delete · esc close",
             Mode::NameInput => " enter save · esc cancel",
+            Mode::Status => " esc close",
         };
         Line::from(keys).style(Style::default().fg(Color::DarkGray))
     };
@@ -1319,8 +1565,44 @@ fn draw(f: &mut Frame, app: &mut App) {
     match app.mode {
         Mode::Profiles => draw_profiles_popup(f, app),
         Mode::NameInput => draw_name_input(f, app),
+        Mode::Status => draw_status_popup(f, app),
         Mode::Browse => {}
     }
+}
+
+fn draw_status_popup(f: &mut Frame, app: &App) {
+    let full = f.area();
+    let h = (app.status_lines.len() as u16 + 2).min(full.height.saturating_sub(2));
+    let area = centered_rect(full.width.saturating_sub(6).min(100), h, full);
+    f.render_widget(Clear, area);
+    let rows: Vec<Row> = app
+        .status_lines
+        .iter()
+        .map(|l| {
+            if l.value.is_empty() {
+                Row::new(vec![Cell::from(l.label.clone()).style(
+                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                )])
+            } else {
+                let style = match l.ok {
+                    Some(true) => Style::default().fg(Color::Green),
+                    Some(false) => Style::default().fg(Color::Red),
+                    None => Style::default().fg(Color::DarkGray),
+                };
+                Row::new(vec![
+                    Cell::from(format!("  {}", l.label)),
+                    Cell::from(l.value.clone()).style(style),
+                ])
+            }
+        })
+        .collect();
+    let table = Table::new(rows, [Constraint::Length(17), Constraint::Min(20)]).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" Status ")
+            .title_bottom(" esc close "),
+    );
+    f.render_widget(table, area);
 }
 
 /// The current profile name, styled so it stands out (yellow "(unsaved)"
@@ -1724,10 +2006,21 @@ fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<()> {
                             app.status = format!("Save failed: {e:#}");
                         }
                     }
+                    KeyCode::Char('S') => {
+                        app.status_lines = app.build_status();
+                        app.mode = Mode::Status;
+                    }
                     KeyCode::Char('L') => app.launch(),
                     _ => {}
                 }
             }
+            Mode::Status => match key.code {
+                KeyCode::Char('q') | KeyCode::Esc | KeyCode::Char('S') | KeyCode::Enter
+                | KeyCode::Char(' ') => {
+                    app.mode = Mode::Browse;
+                }
+                _ => {}
+            },
             Mode::Profiles => match key.code {
                 KeyCode::Char('q') | KeyCode::Esc | KeyCode::Char('p') => {
                     app.mode = Mode::Browse;
@@ -1814,7 +2107,7 @@ fn usage() {
            space / enter    add to or remove from the load order\n  \
            J/K              reorder within the load order\n  \
            p                profiles (enter apply, n new, d delete)\n  \
-           s                save          L launch          q  quit\n\n\
+           s save     S status page     L launch     q quit\n\n\
          Launching (one-time setup):\n  \
            L / --launch write used_mods.txt into the game folder and run\n  \
            `steam -applaunch {APPID}` — Steam still does all the Proton work.\n  \
@@ -1834,20 +2127,32 @@ fn usage() {
            game build id at save time; the packs themselves are copied into\n  \
            the vault. When Steam force-updates a mod, the load order marks\n  \
            it '(updated)' and L loads the pinned version from the vault.\n\n\
+         Staging & overlay:\n  \
+           On launch the load order is materialized as a folder of symlinks\n  \
+           (default: ~/Games/TotalWarWH3/staging), one per mod, each\n  \
+           pointing at the exact pack the game will read — workshop copy,\n  \
+           vaulted pin, or local file. `ls -l` there shows the resolution.\n  \
+           twwh3-run then merges the staging folder into the game's data/\n  \
+           with fuse-overlayfs for the duration of the run (movie packs\n  \
+           work; game files stay pristine). Without fuse-overlayfs it\n  \
+           falls back to plain working-directory loading automatically.\n\n\
          Configuration (~/.config/twwh3-mods/config, `key = value` lines):\n  \
            steam_root  Steam library containing the game (default: ~/.local/share/Steam)\n  \
            data_dir    Base for this tool's data (default: ~/Games/TotalWarWH3)\n  \
            modlists    Profiles          (default: <data_dir>/modlists)\n  \
            vault       Pinned versions   (default: <data_dir>/vault)\n  \
            local_mods  Non-Workshop mods (default: <data_dir>/mods)\n  \
+           staging     Launch symlinks   (default: <data_dir>/staging)\n  \
            moddata     Launcher mod list file    (default: derived from steam_root)\n  \
            workshop    Workshop content dir      (default: derived from steam_root)\n  \
            game_dir    Game install dir          (default: derived from steam_root)\n  \
-           images      auto (default) | halfblocks | off\n\n  \
+           images      auto (default) | halfblocks | off\n  \
+           overlay     on (default) | off — twwh3-run's data/ overlay\n\n  \
            Each key also has an env var that overrides it: STEAM_ROOT,\n  \
            TWWH3_DATA, TWWH3_MODLISTS, TWWH3_VAULT, TWWH3_LOCAL,\n  \
-           TWWH3_MODDATA, TWWH3_WORKSHOP, TWWH3_GAME, TWWH3_IMAGES.\n  \
-           Run `twwh3-mods --paths` to see the resolved values."
+           TWWH3_STAGING, TWWH3_MODDATA, TWWH3_WORKSHOP, TWWH3_GAME,\n  \
+           TWWH3_IMAGES, TWWH3_OVERLAY. `twwh3-mods --paths` shows the\n  \
+           resolved values."
     );
 }
 
@@ -1880,6 +2185,7 @@ fn main() -> Result<()> {
         println!("modlists:     {}", modlists_dir().display());
         println!("vault:        {}", vault_dir().display());
         println!("local_mods:   {}", local_mods_dir().display());
+        println!("staging:      {}", staging_dir().display());
         println!(
             "images:       {}",
             setting("TWWH3_IMAGES", "images").unwrap_or_else(|| "auto".into())

@@ -26,6 +26,11 @@
         };
         twwh3-run = pkgs.writeShellApplication {
           name = "twwh3-run";
+          # fuse-overlayfs mounts the mod overlay; util-linux provides
+          # mountpoint. fusermount3 is intentionally NOT bundled: the
+          # store copy isn't setuid, and bundling it would shadow the
+          # working /run/wrappers/bin wrapper on NixOS.
+          runtimeInputs = [ pkgs.coreutils pkgs.util-linux pkgs.fuse-overlayfs ];
           text = builtins.readFile ./twwh3-run.sh;
           meta = {
             description = "Steam launch-option shim for Total War: WARHAMMER III (use: twwh3-run %command%)";

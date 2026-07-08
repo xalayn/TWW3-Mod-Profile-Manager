@@ -21,6 +21,10 @@
 # Drop .pack files here to use mods from outside the Steam Workshop.
 #local_mods = ~/Games/TotalWarWH3/mods
 
+# Staging folder: rebuilt on every launch with one symlink per enabled
+# mod, pointing at the exact pack version the game will load.
+#staging = ~/Games/TotalWarWH3/staging
+
 # Full-folder snapshots (twwh3-profile).
 #snapshots = ~/Games/TotalWarWH3/profiles
 
@@ -31,3 +35,8 @@
 
 # Thumbnail rendering: auto (query the terminal), halfblocks, or off.
 #images = auto
+
+# twwh3-run merges the staging folder into the game's data/ dir with fuse-overlayfs
+# for the duration of a run (needed for movie packs; keeps the real game
+# files pristine). Set to off to always use working-directory loading.
+#overlay = on

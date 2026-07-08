@@ -1,0 +1,42 @@
+# Build a static Linux binary and attach a tarball to the GitHub release
+# whenever a v* tag is pushed. Users without Nix or a Rust toolchain can
+# then just unpack the tarball into ~/.local/bin.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install musl target
+        run: |
+          sudo apt-get update && sudo apt-get install -y musl-tools
+          rustup target add x86_64-unknown-linux-musl
+
+      - name: Build
+        run: cargo build --release --target x86_64-unknown-linux-musl --manifest-path tui/Cargo.toml
+
+      - name: Package
+        run: |
+          dir="twwh3-tools-${GITHUB_REF_NAME}-x86_64-linux"
+          mkdir -p "$dir"
+          cp tui/target/x86_64-unknown-linux-musl/release/twwh3-mods "$dir/"
+          cp twwh3-profile.sh "$dir/twwh3-profile"
+          cp twwh3-run.sh "$dir/twwh3-run"
+          chmod +x "$dir"/*
+          cp config.example README.md "$dir/"
+          tar czf "$dir.tar.gz" "$dir"
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: twwh3-tools-*.tar.gz
+          generate_release_notes: true
