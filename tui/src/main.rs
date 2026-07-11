@@ -61,14 +61,18 @@ fn usage() {
            -h, --help   Show this help\n\n\
          Keys:\n  \
            tab / h / l      switch pane   j/k or arrows        select\n  \
-           space / enter    add to or remove from the load order\n  \
+           space / enter    Available: add to the load order;\n                    \
+           Load order: enable/disable in place (kept in the list)\n  \
+           x / del          remove the selected mod from the load order\n  \
            J/K              reorder within the load order\n  \
+           R                set which other mods the selected one requires\n                    \
+           (an unmet requirement is flagged in the load order)\n  \
            v                pick which stored version of the hovered\n                    \
            Workshop mod to use (with update dates)\n  \
            U                update all '(updated)' mods to the current\n                    \
            version (pins are otherwise kept on save)\n  \
-           p                profiles (enter apply, n new, r rename,\n                    \
-           e export, d delete)\n  \
+           p                profiles (enter apply, J/K reorder, n new,\n                    \
+           r rename, e export, d delete)\n  \
            o                open the game's data/ folder as the game will\n                    \
            see it (mounts a merged preview; o again unmounts)\n  \
            ? help     s save     S status page     L launch     q quit\n\n\

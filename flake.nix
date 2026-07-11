@@ -43,7 +43,7 @@
 
         twwh3-mods = pkgs.rustPlatform.buildRustPackage {
           pname = "twwh3-mods";
-          version = "0.2.0";
+          version = "0.3.1";
           src = ./tui;
           cargoLock.lockFile = ./tui/Cargo.lock;
           meta = {

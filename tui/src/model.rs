@@ -224,6 +224,10 @@ pub(crate) struct VersionInfo {
 pub(crate) struct Slot {
     pub(crate) id: String,
     pub(crate) idx: Option<usize>,
+    /// Disabled slots keep their spot but are skipped at launch.
+    pub(crate) enabled: bool,
+    /// Ids of other mods this one requires (advisory dependency).
+    pub(crate) requires: Vec<String>,
 }
 
 pub(crate) struct PreviewLine {
@@ -237,6 +241,8 @@ pub(crate) struct PreviewLine {
 pub(crate) struct MlEntry {
     pub(crate) id: String,
     pub(crate) local: bool,
+    pub(crate) enabled: bool,
+    pub(crate) requires: Vec<String>,
     pub(crate) steam_id: Option<String>,
     pub(crate) manifest: Option<String>,
     pub(crate) sha256: Option<String>,

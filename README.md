@@ -24,9 +24,15 @@ Workshop at all.
   loose files (movies, tables) in matching subdirs; the whole folder is
   mirrored into `data/` at launch. The load order lives in profiles; the
   launcher's `moddata.dat` is read for Workshop names but never written.
-- **Profiles** — named mod lists you can switch between, and rename
-  (`r`). Mods missing on disk are remembered, flagged, and skipped
-  rather than lost.
+- **Profiles** — named mod lists you can switch between, rename (`r`),
+  and reorder (`J`/`K`). Mods missing on disk are remembered, flagged,
+  and skipped rather than lost.
+- **Enable/disable in place** — `space` toggles a mod off without
+  removing it from the load order, so it keeps its spot for when you turn
+  it back on. Disabled mods are dimmed and skipped at launch.
+- **Requirements** — mark that one mod requires others (`R`); if a
+  required mod is missing or disabled, the dependent is flagged `⚠ needs …`
+  in the load order.
 - **Version pinning (Workshop)** — each Workshop mod is pinned to an exact
   version (depot manifest), copied into a local store
   (`versioned_workshop_mods/<id>/<manifest>/`). **Pins are sticky**: saving
@@ -135,11 +141,13 @@ twwh3-mods export <profile>      # pack a profile + its packs into a .tar
 twwh3-mods import <bundle.tar>   # unpack a bundle into the store + profiles
 ```
 
-Keys: `tab`/`h`/`l` switch pane · `j`/`k` select · `space`/`enter`
-add/remove · `J`/`K` reorder · `p` profiles · `s` save · `S` status
-page · `o` open the merged `data/` view · `L` launch · `?` help · `q`
-quit. Press `?` for the full key list; in the profiles popup, `n` new,
-`r` rename, `e` export, `d` delete.
+Keys: `tab`/`h`/`l` switch pane · `j`/`k` select · `space`/`enter` add
+(Available) or **enable/disable in place** (load order) · `x` remove ·
+`J`/`K` reorder · `R` set requirements · `v` version · `p` profiles ·
+`s` save · `S` status page · `o` open the merged `data/` view · `L`
+launch · `?` help · `q` quit. Press `?` for the full key list; in the
+profiles popup, `J`/`K` reorder, `n` new, `r` rename, `e` export, `d`
+delete.
 
 `o` opens the game's `data/` folder in your file manager *as the game
 will see it*: if the overlay is up (game running) it opens the live

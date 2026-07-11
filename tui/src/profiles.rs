@@ -20,7 +20,7 @@ impl App {
             .into_iter()
             .map(|e| {
                 let idx = self.pool.iter().position(|m| m.id().eq_ignore_ascii_case(&e.id));
-                Slot { id: e.id, idx }
+                Slot { id: e.id, idx, enabled: e.enabled, requires: e.requires }
             })
             .collect()
     }
@@ -44,7 +44,7 @@ impl App {
             };
             let id = self.pool[idx].id().to_string();
             if seen.insert(id.clone()) {
-                slots.push(Slot { id, idx: Some(idx) });
+                slots.push(Slot { id, idx: Some(idx), enabled: true, requires: Vec::new() });
             }
         }
         slots
@@ -123,18 +123,27 @@ impl App {
     }
 
     pub(crate) fn refresh_profiles(&mut self) {
-        self.profiles = fs::read_dir(modlists_dir())
+        let mut names: Vec<String> = fs::read_dir(modlists_dir())
             .map(|rd| {
-                let mut v: Vec<String> = rd
-                    .flatten()
+                rd.flatten()
                     .map(|e| e.path())
                     .filter(|p| p.extension().is_some_and(|e| e == "json"))
                     .filter_map(|p| p.file_stem()?.to_str().map(String::from))
-                    .collect();
-                v.sort();
-                v
+                    .collect()
             })
             .unwrap_or_default();
+        names.sort();
+        // Apply the saved order (.order); profiles not listed there (new
+        // ones) keep their alphabetical spot after the ordered ones.
+        let mut ordered = Vec::new();
+        for want in fs::read_to_string(profile_order_file()).unwrap_or_default().lines() {
+            let want = want.trim();
+            if let Some(pos) = names.iter().position(|n| n == want) {
+                ordered.push(names.remove(pos));
+            }
+        }
+        ordered.extend(names);
+        self.profiles = ordered;
         let sel = self
             .profile_list
             .selected()
@@ -142,6 +151,22 @@ impl App {
             .min(self.profiles.len().saturating_sub(1));
         self.profile_list
             .select(if self.profiles.is_empty() { None } else { Some(sel) });
+        self.preview_for = None;
+    }
+
+    /// Move the selected profile up/down in the popup and persist the order.
+    pub(crate) fn move_profile(&mut self, delta: isize) {
+        let Some(i) = self.profile_list.selected().filter(|&i| i < self.profiles.len()) else {
+            return;
+        };
+        let j = i as isize + delta;
+        if j < 0 || j as usize >= self.profiles.len() {
+            return;
+        }
+        self.profiles.swap(i, j as usize);
+        self.profile_list.select(Some(j as usize));
+        let _ = fs::create_dir_all(modlists_dir());
+        let _ = fs::write(profile_order_file(), self.profiles.join("\n"));
         self.preview_for = None;
     }
 
@@ -172,6 +197,13 @@ impl App {
                         .get("local")
                         .and_then(Value::as_bool)
                         .unwrap_or_else(|| steam_id.is_none()),
+                    // Older profiles have no "active" field → default enabled.
+                    enabled: e.get("active").and_then(Value::as_bool).unwrap_or(true),
+                    requires: e
+                        .get("requires")
+                        .and_then(Value::as_array)
+                        .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+                        .unwrap_or_default(),
                     steam_id,
                     manifest: e.get("manifest").and_then(Value::as_str).map(String::from),
                     sha256: e.get("sha256").and_then(Value::as_str).map(String::from),
@@ -226,7 +258,10 @@ impl App {
         let mut vaulted = 0usize;
         let mut mods: Vec<Value> = Vec::with_capacity(self.slots.len());
         for s in &self.slots {
-            let mut o = serde_json::json!({ "id": s.id, "active": true });
+            let mut o = serde_json::json!({ "id": s.id, "active": s.enabled });
+            if !s.requires.is_empty() {
+                o["requires"] = Value::from(s.requires.clone());
+            }
             if let Some(entry) = s.idx.map(|i| &self.pool[i]) {
                 o["local"] = Value::from(entry.local);
                 if let Some(sid) = &entry.steam_id {

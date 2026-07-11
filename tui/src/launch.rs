@@ -160,6 +160,9 @@ impl App {
     pub(crate) fn resolve_load_order(&self) -> Vec<ResolvedMod> {
         let mut out: Vec<ResolvedMod> = Vec::new();
         for s in &self.slots {
+            if !s.enabled {
+                continue;
+            }
             let Some(idx) = s.idx else { continue };
             let entry = &self.pool[idx];
             if entry.missing {

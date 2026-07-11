@@ -88,6 +88,11 @@ pub(crate) fn current_profile_file() -> PathBuf {
     modlists_dir().join(".current")
 }
 
+/// Persisted custom ordering of profiles (one name per line).
+pub(crate) fn profile_order_file() -> PathBuf {
+    modlists_dir().join(".order")
+}
+
 pub(crate) fn workshop_dir() -> PathBuf {
     path_setting("TWWH3_WORKSHOP", "workshop")
         .unwrap_or_else(|| steam_root().join(format!("steamapps/workshop/content/{APPID}")))

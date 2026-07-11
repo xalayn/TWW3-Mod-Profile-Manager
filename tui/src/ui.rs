@@ -116,9 +116,10 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App) {
         // Full controls live in the ? modal; the bar just points to it.
         let keys = match app.mode {
             Mode::Browse => " ? help · q quit",
-            Mode::Profiles => " enter apply · r rename · n new · e export · d delete · esc close",
+            Mode::Profiles => " enter apply · J/K reorder · n new · r rename · e export · d delete · esc",
             Mode::NameInput => " enter confirm · esc cancel",
             Mode::VersionPicker => " enter pin · j/k choose · esc cancel",
+            Mode::RequirementPicker => " space toggle · j/k choose · esc done",
             Mode::Status | Mode::Help => " esc close",
         };
         Line::from(keys).style(Style::default().fg(Color::DarkGray))
@@ -131,6 +132,7 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App) {
         Mode::Status => draw_status_popup(f, app),
         Mode::Help => draw_help_popup(f),
         Mode::VersionPicker => draw_version_picker(f, app),
+        Mode::RequirementPicker => draw_requirement_picker(f, app),
         Mode::Browse => {}
     }
 }
@@ -145,13 +147,16 @@ pub(crate) fn draw_help_popup(f: &mut Frame) {
         ("g / G", "jump to top / bottom"),
         ("", ""),
         ("Load order", ""),
-        ("space / enter", "add to / remove from the load order"),
+        ("space / enter", "Available: add · Load order: enable/disable in place"),
+        ("x / del", "remove the selected mod from the load order"),
         ("J / K", "reorder the selected mod"),
+        ("R", "set which other mods this one requires"),
         ("v", "pick which stored version of a Workshop mod to use"),
         ("U", "update all mods flagged (updated) to current"),
         ("", ""),
         ("Profiles (p)", ""),
         ("enter", "apply the selected profile"),
+        ("J / K / shift+↑↓", "reorder profiles"),
         ("n", "new profile from the current load order"),
         ("r", "rename the selected profile"),
         ("e", "export the profile as a portable bundle"),
@@ -240,6 +245,44 @@ pub(crate) fn draw_version_picker(f: &mut Frame, app: &mut App) {
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
         .highlight_symbol("▶ ");
     f.render_stateful_widget(list, area, &mut app.version_state);
+}
+
+/// The `R` requirement picker: toggle which other load-order mods the
+/// selected mod requires.
+pub(crate) fn draw_requirement_picker(f: &mut Frame, app: &mut App) {
+    let Some(rs) = app.req_slot else { return };
+    let name = app.slot_name(rs);
+    let reqs = &app.slots[rs].requires;
+    let cands = app.req_candidates();
+    let items: Vec<ListItem> = cands
+        .iter()
+        .map(|&i| {
+            let s = &app.slots[i];
+            let checked = reqs.iter().any(|r| r.eq_ignore_ascii_case(&s.id));
+            let mark = if checked { "[x]" } else { "[ ]" };
+            let nm = app.slot_name(i);
+            let style = if checked {
+                Style::default().add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            ListItem::new(format!("{mark} {nm}")).style(style)
+        })
+        .collect();
+    let full = f.area();
+    let h = (cands.len() as u16 + 2).clamp(3, full.height.saturating_sub(2));
+    let area = centered_rect(full.width.saturating_sub(8).min(72), h, full);
+    f.render_widget(Clear, area);
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(format!(" {name} requires… "))
+                .title_bottom(" space toggle · esc done "),
+        )
+        .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
+        .highlight_symbol("▶ ");
+    f.render_stateful_widget(list, area, &mut app.req_state);
 }
 
 pub(crate) fn draw_status_popup(f: &mut Frame, app: &App) {
@@ -352,7 +395,7 @@ pub(crate) fn draw_profile(f: &mut Frame, app: &mut App, area: Rect) {
         .iter()
         .enumerate()
         .map(|(n, s)| {
-            let (label, style) = match s.idx {
+            let (mut label, mut style) = match s.idx {
                 Some(i) if !app.pool[i].missing => {
                     if app.slot_updated(s) {
                         (
@@ -367,23 +410,38 @@ pub(crate) fn draw_profile(f: &mut Frame, app: &mut App, area: Rect) {
                     format!("{} (missing)", app.pool[i].name()),
                     Style::default().fg(Color::Red),
                 ),
-                None => (
-                    format!("{} (missing)", s.id),
-                    Style::default().fg(Color::Red),
-                ),
+                None => (format!("{} (missing)", s.id), Style::default().fg(Color::Red)),
             };
+            let mut num_style = Style::default().fg(Color::Yellow);
+            if !s.enabled {
+                label = format!("{label}  (off)");
+                style = Style::default().fg(Color::DarkGray);
+                num_style = Style::default().fg(Color::DarkGray);
+            } else {
+                let unmet = app.unmet_requirements(s);
+                if !unmet.is_empty() {
+                    label = format!("{label}  ⚠ needs {}", unmet.join(", "));
+                    style = Style::default().fg(Color::Red);
+                }
+            }
             Row::new(vec![
-                Cell::from(format!("{:>3}", n + 1)).style(Style::default().fg(Color::Yellow)),
+                Cell::from(format!("{:>3}", n + 1)).style(num_style),
                 Cell::from(label).style(style),
             ])
         })
         .collect();
     let focused = app.focus == Pane::Profile;
     let (hl, sym) = highlight(focused);
+    let off = app.slots.iter().filter(|s| !s.enabled).count();
+    let count = if off > 0 {
+        format!(" ({}, {off} off) ", app.slots.len())
+    } else {
+        format!(" ({}) ", app.slots.len())
+    };
     let title = Line::from(vec![
         Span::raw(" Load order — "),
         profile_span(app),
-        Span::raw(format!(" ({}) ", app.slots.len())),
+        Span::raw(count),
     ]);
     let table = Table::new(rows, [Constraint::Length(3), Constraint::Min(20)])
         .block(pane_block(title, focused))
@@ -545,8 +603,10 @@ pub(crate) fn draw_profiles_popup(f: &mut Frame, app: &mut App) {
     let full = f.area();
     let area = centered_rect(full.width.saturating_sub(8).min(96), 22, full);
     f.render_widget(Clear, area);
+    let [body, footer_area] =
+        Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).areas(area);
     let [names_area, preview_area] =
-        Layout::horizontal([Constraint::Length(30), Constraint::Min(24)]).areas(area);
+        Layout::horizontal([Constraint::Length(30), Constraint::Min(24)]).areas(body);
 
     let items: Vec<ListItem> = if app.profiles.is_empty() {
         vec![ListItem::new("(none yet — press n)")
@@ -565,12 +625,7 @@ pub(crate) fn draw_profiles_popup(f: &mut Frame, app: &mut App) {
             .collect()
     };
     let list = List::new(items)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" Profiles ")
-                .title_bottom(" n new · r rename · e export · d delete "),
-        )
+        .block(Block::default().borders(Borders::ALL).title(" Profiles "))
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
         .highlight_symbol("▶ ");
     f.render_stateful_widget(list, names_area, &mut app.profile_list);
@@ -600,13 +655,13 @@ pub(crate) fn draw_profiles_popup(f: &mut Frame, app: &mut App) {
         })
         .collect();
     f.render_widget(
-        Paragraph::new(lines).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(title)
-                .title_bottom(" enter apply · esc close "),
-        ),
+        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(title)),
         preview_area,
+    );
+    let footer = " enter apply · J/K or shift+↑↓ reorder · n new · r rename · e export · d delete · esc close";
+    f.render_widget(
+        Paragraph::new(footer).style(Style::default().fg(Color::DarkGray)),
+        footer_area,
     );
 }
 

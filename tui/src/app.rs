@@ -26,6 +26,7 @@ pub(crate) enum Mode {
     Status,
     Help,
     VersionPicker,
+    RequirementPicker,
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -78,6 +79,9 @@ pub(crate) struct App {
     pub(crate) version_mod: Option<usize>,
     pub(crate) versions: Vec<VersionInfo>,
     pub(crate) version_state: ListState,
+    /// The requirement picker: which slot's requirements are being edited.
+    pub(crate) req_slot: Option<usize>,
+    pub(crate) req_state: ListState,
 }
 
 impl App {
@@ -118,6 +122,8 @@ impl App {
             version_mod: None,
             versions: Vec::new(),
             version_state: ListState::default(),
+            req_slot: None,
+            req_state: ListState::default(),
         };
 
         // Initial load order: the current profile if it still exists, else
@@ -237,7 +243,7 @@ impl App {
         };
         let i = avail[sel];
         let id = self.pool[i].id().to_string();
-        self.slots.push(Slot { id, idx: Some(i) });
+        self.slots.push(Slot { id, idx: Some(i), enabled: true, requires: Vec::new() });
         self.dirty = true;
         let left = avail.len() - 1;
         self.avail_state
@@ -245,6 +251,96 @@ impl App {
         if self.prof_state.selected().is_none() {
             self.prof_state.select(Some(self.slots.len() - 1));
         }
+    }
+
+    /// Toggle the selected slot enabled/disabled — it keeps its spot in the
+    /// load order but is skipped at launch when disabled.
+    pub(crate) fn toggle_enabled(&mut self) {
+        let Some(sel) = self.prof_state.selected().filter(|&s| s < self.slots.len()) else {
+            return;
+        };
+        self.slots[sel].enabled = !self.slots[sel].enabled;
+        self.dirty = true;
+        let name = self.slot_name(sel);
+        self.status = if self.slots[sel].enabled {
+            format!("Enabled '{name}'")
+        } else {
+            format!("Disabled '{name}' (kept in the load order)")
+        };
+    }
+
+    /// A slot's display name (mod name if installed, else its id).
+    pub(crate) fn slot_name(&self, sel: usize) -> String {
+        match self.slots[sel].idx {
+            Some(i) => self.pool[i].name().to_string(),
+            None => self.slots[sel].id.clone(),
+        }
+    }
+
+    /// Display names of a slot's required mods that aren't satisfied —
+    /// absent from the load order, or present but disabled/missing.
+    pub(crate) fn unmet_requirements(&self, s: &Slot) -> Vec<String> {
+        s.requires
+            .iter()
+            .filter(|req| {
+                !self.slots.iter().any(|o| {
+                    o.enabled
+                        && o.id.eq_ignore_ascii_case(req)
+                        && o.idx.is_some_and(|i| !self.pool[i].missing)
+                })
+            })
+            .map(|req| {
+                self.pool
+                    .iter()
+                    .find(|m| m.id().eq_ignore_ascii_case(req))
+                    .map(|m| m.name().to_string())
+                    .unwrap_or_else(|| req.clone())
+            })
+            .collect()
+    }
+
+    /// Slot indices eligible to be marked as requirements (every load-order
+    /// mod except the one being edited).
+    pub(crate) fn req_candidates(&self) -> Vec<usize> {
+        match self.req_slot {
+            Some(rs) => (0..self.slots.len()).filter(|&i| i != rs).collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// `R`: choose which other load-order mods the selected mod requires.
+    pub(crate) fn open_requirement_picker(&mut self) {
+        if self.focus != Pane::Profile {
+            self.status = "Select a mod in the load order, then R to set what it requires".into();
+            return;
+        }
+        let Some(sel) = self.prof_state.selected().filter(|&s| s < self.slots.len()) else {
+            return;
+        };
+        if self.slots.len() < 2 {
+            self.status = "Add more mods to the load order first".into();
+            return;
+        }
+        self.req_slot = Some(sel);
+        self.req_state.select(Some(0));
+        self.mode = Mode::RequirementPicker;
+    }
+
+    /// Toggle the highlighted candidate as a requirement of the edited mod.
+    pub(crate) fn toggle_requirement(&mut self) {
+        let Some(rs) = self.req_slot else { return };
+        let cands = self.req_candidates();
+        let Some(&ci) = self.req_state.selected().and_then(|s| cands.get(s)) else {
+            return;
+        };
+        let cand_id = self.slots[ci].id.clone();
+        let reqs = &mut self.slots[rs].requires;
+        if let Some(pos) = reqs.iter().position(|r| r.eq_ignore_ascii_case(&cand_id)) {
+            reqs.remove(pos);
+        } else {
+            reqs.push(cand_id);
+        }
+        self.dirty = true;
     }
 
     /// Remove the selected slot from the load order.
@@ -356,8 +452,14 @@ pub(crate) fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Res
                     KeyCode::End | KeyCode::Char('G') => app.select_edge(true),
                     KeyCode::Char(' ') | KeyCode::Enter => match app.focus {
                         Pane::Available => app.add_selected(),
-                        Pane::Profile => app.remove_selected(),
+                        Pane::Profile => app.toggle_enabled(),
                     },
+                    KeyCode::Char('x') | KeyCode::Delete | KeyCode::Backspace => {
+                        if app.focus == Pane::Profile {
+                            app.remove_selected();
+                        }
+                    }
+                    KeyCode::Char('R') => app.open_requirement_picker(),
                     KeyCode::Char('p') => {
                         app.refresh_profiles();
                         app.mode = Mode::Profiles;
@@ -399,6 +501,25 @@ pub(crate) fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Res
                 KeyCode::Enter | KeyCode::Char(' ') => app.pick_version(),
                 _ => {}
             },
+            Mode::RequirementPicker => match key.code {
+                KeyCode::Char('q') | KeyCode::Esc | KeyCode::Enter | KeyCode::Char('R') => {
+                    app.req_slot = None;
+                    app.mode = Mode::Browse;
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    let i = app.req_state.selected().unwrap_or(0);
+                    app.req_state.select(Some(i.saturating_sub(1)));
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    let n = app.req_candidates().len();
+                    if n > 0 {
+                        let i = app.req_state.selected().unwrap_or(0);
+                        app.req_state.select(Some((i + 1).min(n - 1)));
+                    }
+                }
+                KeyCode::Char(' ') => app.toggle_requirement(),
+                _ => {}
+            },
             Mode::Status => match key.code {
                 KeyCode::Char('q') | KeyCode::Esc | KeyCode::Char('S') | KeyCode::Enter
                 | KeyCode::Char(' ') => {
@@ -410,6 +531,10 @@ pub(crate) fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Res
                 KeyCode::Char('q') | KeyCode::Esc | KeyCode::Char('p') => {
                     app.mode = Mode::Browse;
                 }
+                KeyCode::Char('K') => app.move_profile(-1),
+                KeyCode::Char('J') => app.move_profile(1),
+                KeyCode::Up if key.modifiers.contains(KeyModifiers::SHIFT) => app.move_profile(-1),
+                KeyCode::Down if key.modifiers.contains(KeyModifiers::SHIFT) => app.move_profile(1),
                 KeyCode::Up | KeyCode::Char('k') => {
                     let i = app.profile_list.selected().unwrap_or(0);
                     app.profile_list.select(Some(i.saturating_sub(1)));
