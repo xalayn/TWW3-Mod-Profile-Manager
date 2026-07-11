@@ -1,6 +1,6 @@
 [package]
 name = "twwh3-mods"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "TUI mod load-order manager for Total War: WARHAMMER III (Proton/Steam)"
 license = "MIT"
